@@ -501,6 +501,7 @@ from urllib.parse import parse_qs
 
 import httpx
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -555,6 +556,24 @@ for _var in _required_env:
         log.warning(f"⚠️  ENV WARNING: {_var} is not set — check your .env file")
 
 app    = FastAPI(title="Michael — KC Energy Advisors AI Agent")
+
+# ── CORS — allows browser requests from the Vercel frontend ──────────────
+# allow_origin_regex covers all preview/branch deploys automatically.
+# allow_credentials is False because the frontend sends no cookies or auth headers.
+# FastAPI/Starlette CORSMiddleware handles OPTIONS preflight automatically.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://kc-energy-advisors-v2.vercel.app",
+        "https://kcenergyadvisors.com",
+        "http://localhost:3000",
+    ],
+    allow_origin_regex=r"https://kc-energy-advisors-v2[\w-]*\.vercel\.app",
+    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_headers=["Content-Type"],
+    allow_credentials=False,
+)
+
 claude = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 # ── [FIX-7.A] FastAPI request/response middleware ────────────────────────────
@@ -5099,39 +5118,8 @@ async def health():
     }
 
 @app.post("/webhook/website-chat")
-async def website_chat(request: Request):
-    data = await request.json()
-
-    message = data.get("message", "")
-    phone = data.get("phone", "web-user")
-
-    print(f"[WEBSITE CHAT] {message}")
-
-    return {
-        "reply": f"Michael here — got your message: {message}"
-    }
-    data = request.get_json(force=True) or {}
-
-    message = data.get("message", "")
-    phone = data.get("phone", "web-user")
-
-    print(f"[WEBSITE CHAT] {message}")
-
-    # 👇 TEMP reply (just to confirm it's working)
-    return {
-        "reply": f"Michael here — got your message: {message}"
-    }
-# ─────────────────────────────────────────────
-#  ENTRY POINT
-# ─────────────────────────────────────────────
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        "michael_agent:app",
-        host       = "0.0.0.0",
-        port       = int(os.getenv("PORT", 8000)),
-        reload     = True,
-        access_log = True,   # [FIX-7.B] uvicorn built-in access log (method, path, status, ms)
-        log_level  = "info", # [FIX-7.B] emit INFO-level logs so access lines appear
-    )
+async def website_chat(payload: dict):
+    message = payload.get("message", "")
+    name    = payload.get("name", "Visitor")
+    print(f"[WEBSITE CHAT] name={name} message={message}")
+    return {"reply": f"Hey {name}, got your message: {message}"}
