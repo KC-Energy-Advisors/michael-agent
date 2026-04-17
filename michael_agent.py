@@ -5098,7 +5098,29 @@ async def health():
         "booking_link"      : BOOKING_LINK,
     }
 
+@app.post("/webhook/website-chat")
+async def website_chat(request: Request):
+    data = await request.json()
 
+    message = data.get("message", "")
+    phone = data.get("phone", "web-user")
+
+    print(f"[WEBSITE CHAT] {message}")
+
+    return {
+        "reply": f"Michael here — got your message: {message}"
+    }
+    data = request.get_json(force=True) or {}
+
+    message = data.get("message", "")
+    phone = data.get("phone", "web-user")
+
+    print(f"[WEBSITE CHAT] {message}")
+
+    # 👇 TEMP reply (just to confirm it's working)
+    return {
+        "reply": f"Michael here — got your message: {message}"
+    }
 # ─────────────────────────────────────────────
 #  ENTRY POINT
 # ─────────────────────────────────────────────
