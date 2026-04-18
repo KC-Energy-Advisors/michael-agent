@@ -5101,20 +5101,22 @@ async def debug_set_stage(contact_id: str, request: Request):
 
 @app.get("/health")
 async def health():
+    _ak = os.getenv("ANTHROPIC_API_KEY", "")
     return {
-        "status"            : "Michael is online",
-        "version"           : "3.3",
-        "model"             : MODEL,
-        "anthropic_key_set" : bool(os.getenv("ANTHROPIC_API_KEY")),
-        "ghl_key_set"       : bool(os.getenv("GHL_API_KEY")),
-        "ghl_location_set"  : bool(os.getenv("GHL_LOCATION_ID")),
-        "from_number"       : GHL_FROM_NUMBER,
-        "max_daily_msgs"    : MAX_DAILY_MSGS,
-        "active_contacts"   : len(_state_store),
-        "dedup_cache_size"  : len(_processed_fingerprints),
-        "outbound_dedup"    : len(_outbound_fingerprints),
-        "booked_tag"        : BOOKED_TAG,
-        "booking_link"      : BOOKING_LINK,
+        "status"              : "Michael is online",
+        "version"             : "3.9-debug",
+        "model"               : MODEL,
+        "anthropic_key_set"   : bool(_ak),
+        "anthropic_key_prefix": (_ak[:8] + "...") if len(_ak) >= 8 else ("SET-BUT-SHORT" if _ak else "NOT SET"),
+        "ghl_key_set"         : bool(os.getenv("GHL_API_KEY")),
+        "ghl_location_set"    : bool(os.getenv("GHL_LOCATION_ID")),
+        "from_number"         : GHL_FROM_NUMBER,
+        "max_daily_msgs"      : MAX_DAILY_MSGS,
+        "active_contacts"     : len(_state_store),
+        "dedup_cache_size"    : len(_processed_fingerprints),
+        "outbound_dedup"      : len(_outbound_fingerprints),
+        "booked_tag"          : BOOKED_TAG,
+        "booking_link"        : BOOKING_LINK,
     }
 
 
@@ -5277,6 +5279,25 @@ HARD RULES — THESE OVERRIDE EVERYTHING ABOVE
 - NEVER claim the 30% federal tax credit is available. It is not.
 """
 
+@app.get("/debug/claude-test")
+def debug_claude_test():
+    import os
+    from anthropic import Anthropic
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    print("API KEY FOUND:", bool(api_key), flush=True)
+    print("API KEY PREFIX:", api_key[:12] if api_key else "NONE", flush=True)
+    client = Anthropic(api_key=api_key)
+    response = client.messages.create(
+        model="claude-3-5-sonnet-20241022",
+        max_tokens=50,
+        messages=[{"role": "user", "content": "Say hello in one sentence."}]
+    )
+    return {
+        "success": True,
+        "reply": response.content[0].text
+    }
+
+
 @app.post("/webhook/website-chat")
 async def website_chat(payload: dict):
     """
@@ -5299,18 +5320,14 @@ async def website_chat(payload: dict):
         return {"reply": "Hey! What questions do you have about going solar in KC?", "mode": "ai"}
 
     # ── Pre-flight: confirm API key is present before making the call ─────────
-    api_key = os.getenv("ANTHROPIC_API_KEY", "")
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    print("API KEY FOUND:", bool(api_key), flush=True)
+    print("API KEY PREFIX:", api_key[:12] if api_key else "NONE", flush=True)
+
     if not api_key:
         error_msg = "ANTHROPIC_API_KEY is not set in environment variables"
-        print(f"[WEBSITE CHAT] ❌ CONFIG ERROR: {error_msg}", flush=True)
-        return {
-            "reply": (
-                "I'm having a configuration issue on my end. "
-                "Text me directly at (816) 319-0932 and I'll get right back to you."
-            ),
-            "mode":  "error",
-            "error": error_msg,
-        }
+        print("CLAUDE ERROR:", error_msg, flush=True)
+        return {"reply": "TECH ERROR", "mode": "error", "error": error_msg}
 
     # ── Build messages list (history + current) ───────────────────────────────
     # Cap history to last 10 turns to stay well within token limits.
@@ -5345,16 +5362,6 @@ async def website_chat(payload: dict):
         return {"reply": reply, "mode": "ai"}
 
     except Exception as e:
-        # Surface the real error — visible in Render logs AND returned to the
-        # caller so you can see it in your browser network tab without SSHing
-        # into the server.
         error_str = f"{type(e).__name__}: {e}"
-        print(f"[WEBSITE CHAT] ❌ Claude API error: {error_str}", flush=True)
-        return {
-            "reply": (
-                "I'm having a quick tech issue on my end. "
-                "Text me directly at (816) 319-0932 and I'll get right back to you."
-            ),
-            "mode":  "error",
-            "error": error_str,   # visible in network tab for debugging
-        }
+        print("CLAUDE ERROR:", error_str, flush=True)
+        return {"reply": "TECH ERROR", "mode": "error", "error": error_str}
