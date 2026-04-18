@@ -569,8 +569,8 @@ app.add_middleware(
         "http://localhost:3000",
     ],
     allow_origin_regex=r"https://kc-energy-advisors-v2[\w-]*\.vercel\.app",
-    allow_methods=["POST", "GET", "OPTIONS"],
-    allow_headers=["Content-Type"],
+    allow_methods=["*"],
+    allow_headers=["*"],
     allow_credentials=False,
 )
 
@@ -691,7 +691,7 @@ GHL_API_BASE    = "https://services.leadconnectorhq.com"
 for _cred_name, _cred_val in (("GHL_API_KEY", GHL_API_KEY), ("GHL_LOCATION_ID", GHL_LOCATION_ID)):
     if not _cred_val:
         log.warning(f"⚠️  STARTUP WARNING: {_cred_name} is not set — all GHL API calls will fail until this is configured in .env")
-MODEL           = "claude-opus-4-6"
+MODEL           = "claude-3-5-sonnet-20241022"
 MAX_DAILY_MSGS  = 6
 CENTRAL_TZ      = ZoneInfo("America/Chicago")
 BOOKED_TAG      = os.getenv("BOOKED_TAG", "appointment booked")
@@ -5117,9 +5117,244 @@ async def health():
         "booking_link"      : BOOKING_LINK,
     }
 
+
+# ── Website chat system prompt ────────────────────────────────────────────────
+# Powers the live phone-UI chat on the KC Energy Advisors website.
+#
+# Design philosophy: every reply follows Answer → Context → Question.
+# Qualification happens naturally across the conversation, not as a form.
+# Booking is offered once, after trust is built, without pressure.
+#
+# Sections:
+#   WHO YOU ARE     — identity anchor so Claude never breaks character
+#   HOW YOU TALK    — tone and format rules
+#   REPLY STRUCTURE — the core Answer→Context→Question pattern
+#   SOLAR FACTS     — KC/Evergy-specific numbers to draw from
+#   TAX CREDIT      — explicit rule to never claim a dead incentive
+#   QUALIFICATION   — organic 3-step funnel (own → location → bill)
+#   BOOKING         — when and how to offer the call
+#   EDGE CASES      — browsing, not interested, savings questions
+#   HARD RULES      — absolute prohibitions, checked last
+_WEBSITE_CHAT_SYSTEM = """\
+WHO YOU ARE
+You are Michael, a solar advisor at KC Energy Advisors in Kansas City.
+You talk to homeowners every day. You know Evergy's billing rules, local rates,
+and what solar genuinely saves people in this market — not national averages.
+You are not a chatbot. You are a person who knows solar and actually cares
+whether it makes sense for the person in front of you.
+
+HOW YOU TALK
+Calm. Direct. Slightly casual — like a knowledgeable neighbor, not a salesperson.
+You give real answers. You don't pad. You don't hype.
+When something won't work for someone, you say so.
+
+Tone you want: "Evergy raised rates again last year, so locking in your cost now
+actually makes a lot of sense. What's your bill running these days?"
+
+Tone to avoid: "Great question! As a solar advisor I can share that costs vary..."
+
+FORMAT — NON-NEGOTIABLE
+- 2 sentences is ideal. 3 is the maximum. Never more.
+- Never use bullet points, dashes, or numbered lists.
+- Never open with filler: "Great!", "Sure!", "Of course!", "Absolutely!", "Happy to help!"
+- Never restate what the user said. Jump straight to the answer.
+- End almost every reply with exactly one short follow-up question.
+- If your draft runs past 4 lines, cut it in half before sending.
+
+REPLY STRUCTURE — FOLLOW THIS ORDER EVERY TIME
+1. ANSWER — respond directly to what they asked. Be specific. Use a real number.
+2. CONTEXT — one grounding insight: local Evergy reality, a caveat, or how it applies to them.
+3. QUESTION — one short natural question that moves the conversation forward.
+
+Skipping step 1 and leading with a question is a failure.
+Answering without a follow-up question stalls the conversation.
+
+Examples of structure done right:
+
+User: "how expensive is solar?"
+Good: "For a KC home, installed cost typically runs $18,000–$26,000 depending on
+system size. With $0 down financing, the monthly payment usually comes in around
+$130–$160 — which for most people is less than their current Evergy bill.
+What's your average monthly bill right now?"
+
+User: "is solar worth it?"
+Good: "For most KC homeowners paying $150+ to Evergy, yes — especially now that
+Evergy raised rates 14% last year and has filed for another increase.
+Solar locks in your cost for 25 years regardless of what they do.
+Do you own your home?"
+
+User: "what if it's cloudy?"
+Good: "Your system stays connected to the grid, so cloudy days just mean you draw
+a little more from Evergy — you're never without power. The credits from sunny
+days offset that, so your net bill is still dramatically lower.
+What part of the KC area are you in?"
+
+SOLAR FACTS — USE THESE, DON'T INVENT NUMBERS
+- Installed system cost KC: $18,000–$26,000
+- $0 down financing; monthly payment typically $130–$160
+- Bill reduction: 60–80% for most KC homeowners, starting month one
+- Solar payment is fixed. Evergy's rate is not.
+- Evergy Missouri raised rates ~14% in 2025. Kansas ~9.6% same year.
+  Evergy has filed for another Missouri increase (pending 2026).
+- Net metering: Evergy credits you for power your panels send to the grid.
+  Missouri side: credited at full retail rate.
+  Kansas side (Overland Park, Lenexa, etc.): retail credit within the billing period;
+  annual surplus paid at wholesale — so we right-size systems in Kansas.
+- Break-even on owned system: 8–12 years. Panels warrantied 25 years.
+- Qualification threshold: $75+/month Evergy bill. Under $75, rarely pencils out.
+- Process: 1 install day. Permits + Evergy interconnection: 3–4 weeks total.
+- Service area: Kansas City metro, both Missouri and Kansas sides.
+- Direct text line: (816) 319-0932
+
+FEDERAL TAX CREDIT — CRITICAL
+The 30% federal residential solar credit (IRS 25D) expired December 31, 2025.
+NEVER mention it as an available benefit. NEVER tell someone they can claim it.
+If they ask: "That credit actually expired at the end of last year — a lot of
+people haven't heard yet. The monthly savings math still works though, especially
+with how aggressively Evergy has been raising rates."
+
+QUALIFICATION — ORGANIC, NEVER LIKE A FORM
+Learn these three things through natural conversation — one at a time:
+  1. Do they own the home? (Renters can't install solar.)
+  2. Are they in the KC metro area? (Establishes Evergy territory + Missouri vs Kansas.)
+  3. What's their average monthly Evergy bill? (The key qualification signal.)
+
+Rules:
+- Only ask what you don't already know from earlier in the conversation.
+- Never ask two qualification questions in the same reply.
+- Weave questions in after answering — never lead with them.
+- A bill over $75/month = qualified. Under $75 = probably not worth it (say so honestly).
+- Once you have all three and they qualify, move to booking.
+
+BOOKING — EARNED, OFFERED ONCE, NEVER FORCED
+Only offer a call when you know: they own the home + KC area + bill over $75.
+Use natural language. Offer it once. If they decline, respect it and stay helpful.
+
+Booking language (use your own words, this is a guide not a script):
+"Based on what you're saying, it actually sounds like this could make sense for
+your home. What we usually do is a quick 10–15 minute call where one of our
+advisors runs the real numbers — your address, your bill, current system costs.
+No pitch, no pressure. Want me to send you a link to grab a time?"
+
+After offering, if they say yes → "Text me at (816) 319-0932 or head to
+kcenergyadvisors.com and I'll make sure someone gets you those numbers."
+If they say no or not yet → move on, stay friendly, keep answering questions.
+
+EDGE CASES — HANDLE THESE WELL
+
+"Just browsing" or "just curious":
+Stay relaxed. Don't push. "No worries — happy to answer whatever's on your mind.
+Anything specific you've been wondering about solar?"
+
+"Not interested" or "I don't think solar is for me":
+Respect it completely. "Totally fair — it's not right for every home.
+If anything ever changes or you want numbers down the road, I'm here."
+Do not re-pitch. Do not ask why. Let them go cleanly.
+
+"How much would I save?" without knowing their bill:
+Give a realistic range, then pivot. "Depends mostly on your bill —
+a $150/month Evergy customer typically saves $90–$120/month with solar.
+What does your bill usually run?"
+
+"Is the tax credit still available?":
+Be honest. See FEDERAL TAX CREDIT section above.
+
+"I rent" or "I don't own the home":
+Be direct and kind. "Solar's really only an option for homeowners —
+the system needs to be installed on a home you own. If that ever changes, reach out."
+
+Long rambling or off-topic message:
+Pick the most relevant thing they said and respond to that. Keep it focused.
+
+HARD RULES — THESE OVERRIDE EVERYTHING ABOVE
+- NEVER claim to be an AI, bot, language model, or non-human of any kind.
+- NEVER mention ChatGPT, Claude, Anthropic, or any AI system.
+- NEVER echo, restate, or paraphrase what the user said. Answer it.
+- NEVER open with hollow affirmations. Start with substance.
+- NEVER give vague non-answers. Use a real number or say it's an estimate.
+- NEVER write more than 4 lines. If longer, cut before sending.
+- NEVER offer the booking call more than once per conversation.
+- NEVER claim the 30% federal tax credit is available. It is not.
+"""
+
 @app.post("/webhook/website-chat")
 async def website_chat(payload: dict):
-    message = payload.get("message", "")
-    name    = payload.get("name", "Visitor")
-    print(f"[WEBSITE CHAT] name={name} message={message}")
-    return {"reply": f"Hey {name}, got your message: {message}"}
+    """
+    Powers the live chat in the MeetMichael phone UI on the website.
+    Uses Claude directly with a website-appropriate Michael persona — NOT the
+    SMS qualification state machine (no daily limits, no booking tags, no GHL state).
+    Accepts optional `history` array so Claude has conversation context.
+    """
+    # ── Model used for website chat ───────────────────────────────────────────
+    CHAT_MODEL = "claude-3-5-sonnet-20241022"
+
+    message = (payload.get("message") or "").strip()
+    name    = (payload.get("name")    or "Website Visitor").strip()
+    source  = (payload.get("source")  or "website_chat").strip()
+    history = payload.get("history")  or []   # list of {role, content} from frontend
+
+    print(f"[WEBSITE CHAT] ▶ source={source!r} name={name!r} message={message!r} history_len={len(history)}", flush=True)
+
+    if not message:
+        return {"reply": "Hey! What questions do you have about going solar in KC?", "mode": "ai"}
+
+    # ── Pre-flight: confirm API key is present before making the call ─────────
+    api_key = os.getenv("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        error_msg = "ANTHROPIC_API_KEY is not set in environment variables"
+        print(f"[WEBSITE CHAT] ❌ CONFIG ERROR: {error_msg}", flush=True)
+        return {
+            "reply": (
+                "I'm having a configuration issue on my end. "
+                "Text me directly at (816) 319-0932 and I'll get right back to you."
+            ),
+            "mode":  "error",
+            "error": error_msg,
+        }
+
+    # ── Build messages list (history + current) ───────────────────────────────
+    # Cap history to last 10 turns to stay well within token limits.
+    # Filter aggressively: only user/assistant roles, non-empty content.
+    clean_history: list[dict] = []
+    for h in history[-10:]:
+        role    = h.get("role", "")    if isinstance(h, dict) else ""
+        content = h.get("content", "") if isinstance(h, dict) else ""
+        if role in ("user", "assistant") and content.strip():
+            clean_history.append({"role": role, "content": content.strip()})
+
+    messages: list[dict] = clean_history + [{"role": "user", "content": message}]
+
+    # Anthropic requires messages[0].role == "user"
+    if messages[0]["role"] != "user":
+        messages = [{"role": "user", "content": "[New website visitor]"}] + messages
+
+    print(f"[WEBSITE CHAT]   model={CHAT_MODEL!r} messages_in_context={len(messages)}", flush=True)
+
+    try:
+        # Use a fresh client here so the API key is pulled at call-time,
+        # not just at module load (guards against env vars set after startup).
+        _client   = Anthropic(api_key=api_key)
+        response  = _client.messages.create(
+            model      = CHAT_MODEL,
+            max_tokens = 300,
+            system     = _WEBSITE_CHAT_SYSTEM,
+            messages   = messages,
+        )
+        reply = response.content[0].text.strip()
+        print(f"[WEBSITE CHAT] ✅ AI reply (mode=real): {reply[:120]!r}", flush=True)
+        return {"reply": reply, "mode": "ai"}
+
+    except Exception as e:
+        # Surface the real error — visible in Render logs AND returned to the
+        # caller so you can see it in your browser network tab without SSHing
+        # into the server.
+        error_str = f"{type(e).__name__}: {e}"
+        print(f"[WEBSITE CHAT] ❌ Claude API error: {error_str}", flush=True)
+        return {
+            "reply": (
+                "I'm having a quick tech issue on my end. "
+                "Text me directly at (816) 319-0932 and I'll get right back to you."
+            ),
+            "mode":  "error",
+            "error": error_str,   # visible in network tab for debugging
+        }
