@@ -5,6 +5,7 @@ KC Energy Advisors — AI Appointment-Setting Agent
 Agent Name : Michael
 Model      : Claude (claude-opus-4-6)
 Platform   : GoHighLevel (GHL) via inbound webhook
+
 ────────────────────────────────────────────────────────────────────────────────
 
 HOW IT WORKS
@@ -505,6 +506,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from anthropic import Anthropic
 from dotenv import load_dotenv
+
+MODEL = "claude-opus-4-6"
+CHAT_MODEL = MODEL
 
 # ─────────────────────────────────────────────
 #  SETUP
