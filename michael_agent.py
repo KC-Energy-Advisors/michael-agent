@@ -5352,7 +5352,7 @@ async def website_chat(payload: dict):
         # not just at module load (guards against env vars set after startup).
         _client   = Anthropic(api_key=api_key)
         response  = _client.messages.create(
-            model      = CHAT_MODEL,
+            model      = "claude-3-7-sonnet-latest",
             max_tokens = 300,
             system     = _WEBSITE_CHAT_SYSTEM,
             messages   = messages,
