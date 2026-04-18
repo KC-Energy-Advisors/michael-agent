@@ -5166,9 +5166,8 @@ Answering without a follow-up question stalls the conversation.
 Examples of structure done right:
 
 User: "how expensive is solar?"
-Good: "For a KC home, installed cost typically runs $18,000–$26,000 depending on
-system size. With $0 down financing, the monthly payment usually comes in around
-$130–$160 — which for most people is less than their current Evergy bill.
+Good: "For a KC home, installed cost typically runs $18,000–$50,000 depending on
+system size. With $0 down financing, the monthly payment usually comes in right around is not less than their current Evergy bill.
 What's your average monthly bill right now?"
 
 User: "is solar worth it?"
@@ -5184,9 +5183,8 @@ days offset that, so your net bill is still dramatically lower.
 What part of the KC area are you in?"
 
 SOLAR FACTS — USE THESE, DON'T INVENT NUMBERS
-- Installed system cost KC: $18,000–$26,000
-- $0 down financing; monthly payment typically $130–$160
-- Bill reduction: 60–80% for most KC homeowners, starting month one
+- Installed system cost KC: $18,000–$50,000
+- $0 down financing; monthly payment depends on system design, usage, and financing terms.
 - Solar payment is fixed. Evergy's rate is not.
 - Evergy Missouri raised rates ~14% in 2025. Kansas ~9.6% same year.
   Evergy has filed for another Missouri increase (pending 2026).
