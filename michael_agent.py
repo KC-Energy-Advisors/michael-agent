@@ -506,6 +506,9 @@ from fastapi.responses import JSONResponse
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+MODEL = "claude-opus-4-6"
+CHAT_MODEL = MODEL
+
 # ─────────────────────────────────────────────
 #  SETUP
 # ─────────────────────────────────────────────
@@ -691,7 +694,7 @@ GHL_API_BASE    = "https://services.leadconnectorhq.com"
 for _cred_name, _cred_val in (("GHL_API_KEY", GHL_API_KEY), ("GHL_LOCATION_ID", GHL_LOCATION_ID)):
     if not _cred_val:
         log.warning(f"⚠️  STARTUP WARNING: {_cred_name} is not set — all GHL API calls will fail until this is configured in .env")
-MODEL           = "claude-3-5-sonnet-20241022"
+        model = MODEL
 MAX_DAILY_MSGS  = 6
 CENTRAL_TZ      = ZoneInfo("America/Chicago")
 BOOKED_TAG      = os.getenv("BOOKED_TAG", "appointment booked")
@@ -5277,7 +5280,7 @@ def debug_claude_test():
     print("API KEY PREFIX:", api_key[:12] if api_key else "NONE", flush=True)
     client = Anthropic(api_key=api_key)
     response = client.messages.create(
-        model="claude-3-5-sonnet-20241022",
+        model=MODEL,
         max_tokens=50,
         messages=[{"role": "user", "content": "Say hello in one sentence."}]
     )
@@ -5295,7 +5298,7 @@ async def website_chat(payload: dict):
     SMS qualification state machine (no daily limits, no booking tags, no GHL state).
     Accepts optional `history` array so Claude has conversation context.
     """
-    CHAT_MODEL = "claude-3-5-sonnet-20241022"
+    CHAT_MODEL = MODEL
 
     # ── 1. REQUEST RECEIVED ───────────────────────────────────────────────────
     print("[website-chat] request received", flush=True)
