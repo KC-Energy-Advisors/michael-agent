@@ -5,7 +5,6 @@ KC Energy Advisors — AI Appointment-Setting Agent
 Agent Name : Michael
 Model      : Claude (claude-opus-4-6)
 Platform   : GoHighLevel (GHL) via inbound webhook
-
 ────────────────────────────────────────────────────────────────────────────────
 
 HOW IT WORKS
@@ -507,9 +506,6 @@ from fastapi.responses import JSONResponse
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
-MODEL = "claude-opus-4-6"
-CHAT_MODEL = MODEL
-
 # ─────────────────────────────────────────────
 #  SETUP
 # ─────────────────────────────────────────────
@@ -695,7 +691,7 @@ GHL_API_BASE    = "https://services.leadconnectorhq.com"
 for _cred_name, _cred_val in (("GHL_API_KEY", GHL_API_KEY), ("GHL_LOCATION_ID", GHL_LOCATION_ID)):
     if not _cred_val:
         log.warning(f"⚠️  STARTUP WARNING: {_cred_name} is not set — all GHL API calls will fail until this is configured in .env")
-model=MODEL
+MODEL           = "claude-3-5-sonnet-20241022"
 MAX_DAILY_MSGS  = 6
 CENTRAL_TZ      = ZoneInfo("America/Chicago")
 BOOKED_TAG      = os.getenv("BOOKED_TAG", "appointment booked")
@@ -5103,25 +5099,14 @@ async def debug_set_stage(contact_id: str, request: Request):
 #  HEALTH CHECK
 # ─────────────────────────────────────────────
 
+@app.get("/")
+async def root():
+    """Render health check — must return 200 instantly."""
+    return {"status": "ok"}
+
 @app.get("/health")
 async def health():
-    _ak = os.getenv("ANTHROPIC_API_KEY", "")
-    return {
-        "status"              : "Michael is online",
-        "version"             : "3.9-debug",
-        "model"               : MODEL,
-        "anthropic_key_set"   : bool(_ak),
-        "anthropic_key_prefix": (_ak[:8] + "...") if len(_ak) >= 8 else ("SET-BUT-SHORT" if _ak else "NOT SET"),
-        "ghl_key_set"         : bool(os.getenv("GHL_API_KEY")),
-        "ghl_location_set"    : bool(os.getenv("GHL_LOCATION_ID")),
-        "from_number"         : GHL_FROM_NUMBER,
-        "max_daily_msgs"      : MAX_DAILY_MSGS,
-        "active_contacts"     : len(_state_store),
-        "dedup_cache_size"    : len(_processed_fingerprints),
-        "outbound_dedup"      : len(_outbound_fingerprints),
-        "booked_tag"          : BOOKED_TAG,
-        "booking_link"        : BOOKING_LINK,
-    }
+    return {"status": "ok"}
 
 
 # ── Website chat system prompt ────────────────────────────────────────────────
@@ -5292,7 +5277,7 @@ def debug_claude_test():
     print("API KEY PREFIX:", api_key[:12] if api_key else "NONE", flush=True)
     client = Anthropic(api_key=api_key)
     response = client.messages.create(
-        model=MODEL,
+        model="claude-3-5-sonnet-20241022",
         max_tokens=50,
         messages=[{"role": "user", "content": "Say hello in one sentence."}]
     )
@@ -5310,32 +5295,38 @@ async def website_chat(payload: dict):
     SMS qualification state machine (no daily limits, no booking tags, no GHL state).
     Accepts optional `history` array so Claude has conversation context.
     """
-    # ── Model used for website chat ───────────────────────────────────────────
-    model=MODEL
+    CHAT_MODEL = "claude-3-5-sonnet-20241022"
 
-    message = (payload.get("message") or "").strip()
-    name    = (payload.get("name")    or "Website Visitor").strip()
-    source  = (payload.get("source")  or "website_chat").strip()
-    history = payload.get("history")  or []   # list of {role, content} from frontend
+    # ── 1. REQUEST RECEIVED ───────────────────────────────────────────────────
+    print("[website-chat] request received", flush=True)
 
-    print(f"[WEBSITE CHAT] ▶ source={source!r} name={name!r} message={message!r} history_len={len(history)}", flush=True)
+    # ── 2. PAYLOAD PARSE ─────────────────────────────────────────────────────
+    try:
+        message = (payload.get("message") or "").strip()
+        name    = (payload.get("name")    or "Website Visitor").strip()
+        source  = (payload.get("source")  or "website_chat").strip()
+        history = payload.get("history")  or []
+        print(f"[website-chat] payload parsed — source={source!r} name={name!r} "
+              f"msg_len={len(message)} history_len={len(history)}", flush=True)
+    except Exception as parse_err:
+        print(f"[website-chat] payload parse FAILED: {parse_err}", flush=True)
+        return {"reply": "TECH ERROR", "mode": "error", "error": f"PayloadParseError: {parse_err}"}
 
     if not message:
+        print("[website-chat] empty message — returning prompt", flush=True)
         return {"reply": "Hey! What questions do you have about going solar in KC?", "mode": "ai"}
 
-    # ── Pre-flight: confirm API key is present before making the call ─────────
+    # ── 3. API KEY CHECK ──────────────────────────────────────────────────────
     api_key = os.getenv("ANTHROPIC_API_KEY")
-    print("API KEY FOUND:", bool(api_key), flush=True)
-    print("API KEY PREFIX:", api_key[:12] if api_key else "NONE", flush=True)
+    print(f"[website-chat] api_key present={bool(api_key)} "
+          f"prefix={api_key[:12] if api_key else 'NONE'}", flush=True)
 
     if not api_key:
         error_msg = "ANTHROPIC_API_KEY is not set in environment variables"
-        print("CLAUDE ERROR:", error_msg, flush=True)
+        print(f"[website-chat] config error — {error_msg}", flush=True)
         return {"reply": "TECH ERROR", "mode": "error", "error": error_msg}
 
-    # ── Build messages list (history + current) ───────────────────────────────
-    # Cap history to last 10 turns to stay well within token limits.
-    # Filter aggressively: only user/assistant roles, non-empty content.
+    # ── 4. BUILD MESSAGE HISTORY ──────────────────────────────────────────────
     clean_history: list[dict] = []
     for h in history[-10:]:
         role    = h.get("role", "")    if isinstance(h, dict) else ""
@@ -5345,27 +5336,43 @@ async def website_chat(payload: dict):
 
     messages: list[dict] = clean_history + [{"role": "user", "content": message}]
 
-    # Anthropic requires messages[0].role == "user"
     if messages[0]["role"] != "user":
         messages = [{"role": "user", "content": "[New website visitor]"}] + messages
 
-    print(f"[WEBSITE CHAT]   model={CHAT_MODEL!r} messages_in_context={len(messages)}", flush=True)
+    # ── 5. ANTHROPIC CALL STARTED ─────────────────────────────────────────────
+    print(f"[website-chat] calling Anthropic — model={CHAT_MODEL!r} "
+          f"messages_in_context={len(messages)}", flush=True)
 
     try:
-        # Use a fresh client here so the API key is pulled at call-time,
-        # not just at module load (guards against env vars set after startup).
-        _client   = Anthropic(api_key=api_key)
-        response  = _client.messages.create(
-            model      = MODEL,
+        _client  = Anthropic(api_key=api_key)
+        response = _client.messages.create(
+            model      = CHAT_MODEL,
             max_tokens = 300,
             system     = _WEBSITE_CHAT_SYSTEM,
             messages   = messages,
         )
+
+        # ── 6. ANTHROPIC REPLY RECEIVED ───────────────────────────────────────
         reply = response.content[0].text.strip()
-        print(f"[WEBSITE CHAT] ✅ AI reply (mode=real): {reply[:120]!r}", flush=True)
+        print(f"[website-chat] Anthropic reply received — "
+              f"chars={len(reply)} preview={reply[:80]!r}", flush=True)
+
+        # ── 7. RESPONSE RETURNED ──────────────────────────────────────────────
+        print("[website-chat] returning mode=ai", flush=True)
         return {"reply": reply, "mode": "ai"}
 
     except Exception as e:
         error_str = f"{type(e).__name__}: {e}"
-        print("CLAUDE ERROR:", error_str, flush=True)
+        print(f"[website-chat] Anthropic call FAILED — {error_str}", flush=True)
         return {"reply": "TECH ERROR", "mode": "error", "error": error_str}
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+# Used when Render's start command is: python michael_agent.py
+# If Render uses:  uvicorn michael_agent:app --host 0.0.0.0 --port $PORT
+# this block is ignored — both methods work correctly.
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 10000))
+    print(f"[STARTUP] Starting uvicorn on 0.0.0.0:{port}", flush=True)
+    uvicorn.run(app, host="0.0.0.0", port=port, access_log=True, log_level="info")
