@@ -1923,20 +1923,20 @@ def build_cost_answer(state: dict) -> str:
 
     if bill:
         bill_line = (
-            f"With a {bill} bill, what solar does is replace that variable Evergy charge "
-            f"with one fixed payment — so you're not subject to whatever they decide to raise rates to next."
+            f"With a {bill} bill, you're really not buying solar — you're replacing that Evergy charge "
+            f"with one fixed payment that doesn't move when they raise rates."
         )
     else:
         bill_line = (
-            "What solar does is replace your variable Evergy bill with one fixed monthly payment "
-            "— the goal is control over your cost, not just lowering it."
+            "You're not really buying solar — you're replacing your Evergy bill with a fixed payment "
+            "that depends on your home, usage, and how your system gets set up."
         )
 
     base = (
-        f"No upfront cost — that's actually one of the most common misconceptions. "
-        f"{bill_line} "
-        f"The consultation is completely free — your advisor pulls your actual usage data "
-        f"and runs the real numbers for your specific home so you can decide if it makes sense."
+        f"I wish I could give you a simple number, but it genuinely depends on your home, "
+        f"your usage, and how everything gets structured. {bill_line} "
+        f"The only way to get a real number is to look at your actual setup — that's exactly "
+        f"what the free consultation does."
     )
 
     if qualified:
@@ -2102,7 +2102,7 @@ Never ignore a question by jumping straight to the booking invite.
 
 ━━ OBJECTIONS ━━
 • "Not interested" → "No worries — if that ever changes, we're here." [DISQUALIFY:NOT_INTERESTED]
-• "How much does solar cost?" → "That's exactly what the consultation covers — your advisor will go through real numbers for your specific home. It's completely free."
+• "How much does solar cost?" → "I wish I could give you a simple number — it really depends on your home, usage, and how your system gets set up. You're not buying solar so much as replacing your Evergy bill with something fixed. Do you own your home?"
 • "Is this a scam?" → "Legit question — KC Energy Advisors is a licensed local solar firm out of KC. Free consultation, zero obligation."
 • "Can someone call me?" → "Totally — easiest way is to grab a time here and your advisor will come out to you: https://kcenergyadvisors.com/get-solar-info"
 • "Is the tax credit still available?" → "That specific credit expired recently, but incentives can change depending on timing and location — that's something we check when we look at your actual home."
@@ -5211,9 +5211,9 @@ Answering without a follow-up question stalls the conversation.
 Examples of structure done right:
 
 User: "how expensive is solar?"
-Good: "For many KC homeowners, installed cost ranges from $18,000 to $50,000
-depending on home size and system design. With $0 down financing, the monthly
-payment depends on the final setup — everyone's a little different.
+Good: "I wish I could give you a simple number, but it genuinely depends on your
+home, usage, and how everything gets structured. You're not really buying solar —
+you're replacing your Evergy bill with a fixed payment that doesn't move.
 Do you own your home?"
 
 User: "is solar worth it?"
