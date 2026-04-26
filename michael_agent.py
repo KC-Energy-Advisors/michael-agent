@@ -485,7 +485,7 @@ SETUP
     GHL_API_KEY=your_ghl_api_key
     GHL_LOCATION_ID=your_location_id
     GHL_FROM_NUMBER=+18163190932
-    BOOKING_LINK=https://kcenergyadvisors.com/get-solar-info
+    BOOKING_LINK=https://api.leadconnectorhq.com/widget/booking/0fu9WVucPWOYhM0tSEGE
     BOOKED_TAG=appointment booked
     PORT=8000
 """
@@ -664,31 +664,39 @@ async def _startup_diagnostic():
 # This hardcoded constant is what EVERY outbound booking SMS must use.
 # It is also what sanitize_outbound_message() replaces bad URLs WITH — so it
 # must be correct regardless of what .env contains.
-_CORRECT_BOOKING_URL = "https://kcenergyadvisors.com/get-solar-info"
+_CORRECT_BOOKING_URL = "https://api.leadconnectorhq.com/widget/booking/0fu9WVucPWOYhM0tSEGE"
 
 # BOOKING_LINK is the runtime variable used throughout the module.
 # We read from .env for flexibility, but immediately override any bad value.
 BOOKING_LINK = os.getenv("BOOKING_LINK", _CORRECT_BOOKING_URL)
 
-# [FIX-5 + FIX-6A] Startup guard — detect AND self-heal a bad .env value.
+# [FIX-5 + FIX-6A] Startup guard — detect AND self-heal a stale .env value.
 # Previously this block only LOGGED the bad value; it never fixed BOOKING_LINK,
 # so the bad URL flowed into every booking SMS for the entire process lifetime.
 # Now we override BOOKING_LINK to _CORRECT_BOOKING_URL immediately.
-_OLD_BOOKING_DOMAINS = ("api.leadconnectorhq.com", "leadconnectorhq.com/widget/booking")
+#
+# Post-STL-migration: the live URL IS a leadconnectorhq.com widget URL, so the
+# old `leadconnectorhq.com/widget/booking` substring match would falsely flag
+# the live URL itself. Updated to match only the LEGACY kcenergyadvisors.com
+# booking path (the previous KC-era calendar URL).
+_OLD_BOOKING_DOMAINS = (
+    "kcenergyadvisors.com/get-solar-info",     # legacy KC-era calendar URL
+    "kcenergyadvisors.net/get-solar-info",     # legacy alt-domain variant
+)
 if any(old in BOOKING_LINK for old in _OLD_BOOKING_DOMAINS):
     log.warning("=" * 70)
-    log.warning("⚠️  BOOKING LINK WARNING — old LeadConnector URL detected in .env!")
+    log.warning("⚠️  BOOKING LINK WARNING — legacy KC booking URL detected in .env!")
     log.warning(f"⚠️  Bad value     : {BOOKING_LINK}")
     log.warning(f"⚠️  Self-healing  : BOOKING_LINK overridden to {_CORRECT_BOOKING_URL}")
-    log.warning("⚠️  Fix your .env: BOOKING_LINK=https://kcenergyadvisors.com/get-solar-info")
+    log.warning(f"⚠️  Fix your .env: BOOKING_LINK={_CORRECT_BOOKING_URL}")
     log.warning("=" * 70)
     print("=" * 70)
-    print("⚠️  STARTUP: bad BOOKING_LINK in .env — self-healing to correct URL")
+    print("⚠️  STARTUP: stale BOOKING_LINK in .env — self-healing to STL URL")
     print(f"⚠️  Was  : {BOOKING_LINK}")
     print(f"⚠️  Now  : {_CORRECT_BOOKING_URL}")
     print("⚠️  Update your .env to silence this warning.")
     print("=" * 70)
-    BOOKING_LINK = _CORRECT_BOOKING_URL   # ← THE FIX: override the bad env value
+    BOOKING_LINK = _CORRECT_BOOKING_URL   # ← THE FIX: override the stale env value
 GHL_API_KEY     = os.getenv("GHL_API_KEY",     "")   # must be set in .env — no hardcoded fallback
 GHL_LOCATION_ID = os.getenv("GHL_LOCATION_ID", "")   # must be set in .env — no hardcoded fallback
 GHL_FROM_NUMBER = os.getenv("GHL_FROM_NUMBER", "+18163190932")
@@ -2117,7 +2125,8 @@ Never ignore a question by jumping straight to the booking invite.
 • "Not interested" → "No worries — if that ever changes, we're here." [DISQUALIFY:NOT_INTERESTED]
 • "How much does solar cost?" → "I wish I could give you a simple number — it really depends on your home, usage, and how your system gets set up. You're not buying solar so much as replacing your Ameren bill with something fixed. Do you own your home?"
 • "Is this a scam?" → "Legit question — STL Energy Advisors (a division of KC Energy Advisors) is a licensed local solar firm serving the Missouri side of the St. Louis area. Free in-home review, zero obligation."
-• "Can someone call me?" → "Totally — easiest way is to grab a time here and I'll come by your home: https://kcenergyadvisors.com/get-solar-info"
+• "Can someone call me?" → "Totally — easiest way is to grab a time here and I'll come by your home.
+   https://api.leadconnectorhq.com/widget/booking/0fu9WVucPWOYhM0tSEGE"
 • "Is the tax credit still available?" → "That specific credit expired recently, but incentives can change depending on timing and location — that's something we check when we look at your actual home."
 • "How much will I save?" → "Hard to say without looking at your actual Ameren usage — that's exactly what the in-home review figures out, and if it doesn't pencil out I'll tell you straight."
 • Persistent hesitation → "There's no commitment — it's just a real look at whether solar actually makes sense for your home and your Ameren bill."
@@ -2667,10 +2676,14 @@ def build_booking_message(first_name: str = "", full_name: str = "") -> str:
 #   2. send_sms_via_ghl() — right before the HTTP call
 # ─────────────────────────────────────────────
 
-# Matches the specific broken URL and any other
-# leadconnectorhq.com/widget/booking/... variant
+# Matches LeadConnector widget booking URLs that are NOT our live STL booking link.
+# The negative lookahead exempts the current correct booking ID so the live URL
+# passes through the sanitizer unchanged. Any OTHER widget/booking ID — a stale
+# KC-era widget, a hallucinated ID, etc. — is replaced with _CORRECT_BOOKING_URL.
 _BAD_BOOKING_URL_RE = re.compile(
-    r'https?://[a-zA-Z0-9._-]*leadconnectorhq\.com/widget/booking/[^\s"\'<>]*',
+    r'https?://[a-zA-Z0-9._-]*leadconnectorhq\.com/widget/booking/'
+    r'(?!0fu9WVucPWOYhM0tSEGE\b)'
+    r'[^\s"\'<>]*',
     re.IGNORECASE,
 )
 
@@ -5242,7 +5255,9 @@ SOLAR FACTS — USE THESE, DON'T INVENT NUMBERS
 - Service area: Missouri side of the St. Louis metro only — St. Louis County, St. Charles, Jefferson,
   Franklin, Lincoln, Warren counties, and surrounding Missouri-side areas. We do NOT serve Illinois,
   rural co-ops, or non-Ameren utilities.
-- Booking link: https://kcenergyadvisors.com/get-solar-info (use this, never tell them to text you)
+- Booking link: https://api.leadconnectorhq.com/widget/booking/0fu9WVucPWOYhM0tSEGE
+  Always send the URL on its own line, no markdown, no parentheses or punctuation directly after.
+  Never tell them to text you.
 
 FEDERAL TAX CREDIT — CRITICAL
 NEVER claim any specific tax credit is currently available. NEVER tell someone they can claim it.
@@ -5276,10 +5291,13 @@ What we do is a quick in-home visit — I come by, go over your actual Ameren bi
 walk through your roof and usage, and tell you straight if it pencils out for your home.
 No pitch, no pressure. Want me to send you the link to grab a time?"
 
-After offering, if they say yes → give them the direct link immediately:
-"Here's the link to grab a time that works: https://kcenergyadvisors.com/get-solar-info
+After offering, if they say yes → give them the direct link immediately, with the URL on its own line:
+"Here's the link to grab a time:
+https://api.leadconnectorhq.com/widget/booking/0fu9WVucPWOYhM0tSEGE
+
 No prep needed — bring your latest Ameren bill and we'll review the real numbers."
-Output the full URL exactly as written above. Do not paraphrase it.
+Output the full URL exactly as written above. Do not paraphrase it. Do not wrap it in markdown,
+brackets, or HTML. Do not put any punctuation directly after the URL — let it stand alone on its line.
 Do not say "text me", "call me", or any other contact method as a substitute.
 If they say no or not yet → move on, stay friendly, keep answering questions.
 
@@ -5325,7 +5343,8 @@ HARD RULES — THESE OVERRIDE EVERYTHING ABOVE
 - NEVER say "call", "phone call", "15-minute call", or "quick call".
   The next step is always an in-home visit using the booking link.
 - NEVER tell someone to "text me" or give the phone number as a first option.
-  Always direct to: https://kcenergyadvisors.com/get-solar-info
+  Always direct to the booking URL on its own line:
+  https://api.leadconnectorhq.com/widget/booking/0fu9WVucPWOYhM0tSEGE
 - NEVER say "free electricity", "the bill goes away", or anything that implies the Ameren bill disappears.
 - NEVER give specific savings amounts, dollar ranges, or percentages.
   No "$X/month", no "save 30%", no "cut your bill in half", no ranges like "$90–$120".
