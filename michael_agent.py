@@ -1527,40 +1527,62 @@ def _inbound_fingerprint(
     return fp, desc
 
 
+def _evict_fingerprints_if_needed() -> None:
+    """LRU eviction for the inbound fingerprint cache."""
+    if len(_processed_fingerprints) >= _MAX_DEDUP_CACHE:
+        _keep = list(_processed_fingerprints)[_MAX_DEDUP_CACHE // 2 :]
+        _processed_fingerprints.clear()
+        _processed_fingerprints.update(_keep)
+
+
 def is_duplicate_inbound(
     contact_id: str,
     message: str,
     ghl_message_id: str = "",
 ) -> tuple[bool, str]:
     """
-    [FIX-9] Replaces the old is_duplicate().
+    Always checks and registers BOTH tiers simultaneously.
 
-    Returns (is_duplicate: bool, reason: str).
-    Callers MUST use the reason string in their skip log.
+    TIER 1 (when ghl_message_id present): exact GHL event identity.
+    TIER 2 (always):                       8-second content-hash window.
 
-    True  → this webhook is a duplicate delivery; skip it.
-    False → this webhook is new; process it (fingerprint has been registered).
+    Checking BOTH tiers fixes the dual-webhook problem:
+      GHL fires two webhooks for one customer SMS with DIFFERENT message IDs.
+      TIER 1 alone passes both (different IDs = different fingerprints).
+      TIER 2 catches the second one (same content + same time bucket = same hash).
 
-    Logging contract (caller must print on True):
-      [DEDUP] SKIPPED | {reason} | contact={contact_id}
-
-    Logging contract (caller should print on False when debugging):
-      [DEDUP] ALLOWED | {reason} | contact={contact_id}
+    Registering both also means that whichever path processes the first webhook
+    (booked path or chat-widget path) always plants the content fingerprint, so the
+    second webhook is blocked regardless of which code path it arrives on.
     """
-    fp, desc = _inbound_fingerprint(contact_id, message, ghl_message_id)
+    # Always compute TIER 2 content fingerprint
+    t2_fp, t2_desc = _inbound_fingerprint(contact_id, message, ghl_message_id="")
 
-    if fp in _processed_fingerprints:
-        return True, f"fingerprint_match | {desc}"
+    if ghl_message_id:
+        # Compute TIER 1 exact-ID fingerprint
+        t1_raw = f"GHL_MSG:{contact_id}:{ghl_message_id}"
+        t1_fp  = hashlib.sha1(t1_raw.encode()).hexdigest()
 
-    # Not a duplicate — register fingerprint and allow through
-    if len(_processed_fingerprints) >= _MAX_DEDUP_CACHE:
-        # LRU eviction: keep newest half
-        _keep = list(_processed_fingerprints)[_MAX_DEDUP_CACHE // 2 :]
-        _processed_fingerprints.clear()
-        _processed_fingerprints.update(_keep)
+        # Check TIER 1 first (same event_id = definite duplicate)
+        if t1_fp in _processed_fingerprints:
+            return True, f"tier=1_ghl_id | ghl_message_id={ghl_message_id!r} | fp={t1_fp[:12]}"
 
-    _processed_fingerprints.add(fp)
-    return False, f"new_event | {desc}"
+        # Check TIER 2 (same content within 8s = duplicate delivery, different ID)
+        if t2_fp in _processed_fingerprints:
+            return True, f"tier=2_content_window | ghl_message_id={ghl_message_id!r} (different from first) | {t2_desc}"
+
+        # New event — register both so either tier catches subsequent duplicates
+        _evict_fingerprints_if_needed()
+        _processed_fingerprints.add(t1_fp)
+        _processed_fingerprints.add(t2_fp)
+        return False, f"new_event | tier=1_ghl_id={ghl_message_id!r} | also_registered_tier2 | {t2_desc}"
+    else:
+        # No GHL message ID — TIER 2 only
+        if t2_fp in _processed_fingerprints:
+            return True, f"fingerprint_match | {t2_desc}"
+        _evict_fingerprints_if_needed()
+        _processed_fingerprints.add(t2_fp)
+        return False, f"new_event | {t2_desc}"
 
 
 # Keep old name as a shim so any remaining callers don't break.
@@ -2581,7 +2603,8 @@ def _build_booked_followup_prompt(state: dict) -> str:
 • 1-2 sentences max
 • Warm, confident, local tone
 • No filler words ("Great!", "Absolutely!")
-• No URLs, no tags, no qualification language""".strip()
+• No URLs, no tags, no qualification language
+• NEVER say "Looks like that sent twice", "I already answered this", "You asked that before", or any reference to duplication or technical issues — that is internal system behavior, never customer-facing""".strip()
 
 
 # ─────────────────────────────────────────────
@@ -2880,8 +2903,11 @@ def michael_agent(contact_id: str, inbound_text: str) -> Optional[str]:
             # Build minimal booked-follow-up system prompt — qualification is UNREACHABLE
             booked_system = _build_booked_followup_prompt(state)
 
-            # Append message to history
-            state["messages"].append({"role": "user", "content": inbound_text})
+            # Append message to history — guard against concurrent-webhook race
+            # where the same message was already appended by a prior webhook call.
+            _last_msg = state["messages"][-1] if state["messages"] else {}
+            if not (_last_msg.get("role") == "user" and _last_msg.get("content") == inbound_text):
+                state["messages"].append({"role": "user", "content": inbound_text})
             msgs_for_api = state["messages"]
             if msgs_for_api and msgs_for_api[0].get("role") == "assistant":
                 msgs_for_api = [{"role": "user", "content": "[Lead has an appointment booked]"}] + msgs_for_api
@@ -3620,6 +3646,41 @@ async def inbound_webhook(request: Request):
                     f"(universal resolution, not appt-gated)"
                 )
                 contact_id = _resolved_cid
+
+        # ══════════════════════════════════════════════════════════════
+        #  UNIVERSAL INBOUND DEDUP — runs before ALL routing paths
+        #
+        #  GHL fires 2-4 webhooks per customer SMS:
+        #    • Raw inbound (has messageId "A")
+        #    • Customer Replied workflow (different messageId "B")
+        #  The per-path dedup in the chat-widget path never fires for booked
+        #  contacts (they take a different branch).  is_duplicate_inbound() now
+        #  checks BOTH TIER 1 and TIER 2, so the first webhook registers the
+        #  content fingerprint regardless of path, and the second is blocked here.
+        # ══════════════════════════════════════════════════════════════
+        if direction == "inbound" and bool(parsed.get("has_real_message")):
+            _ud_msg_id  = parsed.get("event_id", "")
+            _ud_msg_txt = parsed.get("message", "")
+            _ud_is_dup, _ud_reason = is_duplicate_inbound(
+                contact_id, _ud_msg_txt, ghl_message_id=_ud_msg_id
+            )
+            print(
+                f"[DEDUP] {'🔒 BLOCKED' if _ud_is_dup else '✅ ALLOWED'} "
+                f"| {_ud_reason} | contact={contact_id}",
+                flush=True,
+            )
+            log.info(
+                f"[{contact_id}] Universal dedup: "
+                f"{'duplicate — skipping' if _ud_is_dup else 'new event — proceeding'} | {_ud_reason}"
+            )
+            if _ud_is_dup:
+                return JSONResponse({
+                    "status"      : "success",
+                    "skipped"     : True,
+                    "reason"      : "duplicate_inbound_universal",
+                    "dedup_reason": _ud_reason,
+                    "contact_id"  : contact_id,
+                })
 
         # ══════════════════════════════════════════════════════════════
         #  PRIORITY ROUTING GUARDS  [FIX-7 / FIX-9]
@@ -4723,31 +4784,7 @@ async def inbound_webhook(request: Request):
         print(f"[INBOUND]  Message     : {inbound_text!r}")
         print(f"{'#'*60}\n")
 
-        # ── [FIX-9] Inbound dedup — two-tier, short window ───────────────
-        # Uses is_duplicate_inbound() which returns (bool, reason_str).
-        # TIER 1: GHL message ID (exact event identity — no false positives).
-        # TIER 2: 8-second content window (catches GHL's rapid re-delivery).
-        # Old 1-minute window caused valid replies like "Yes" to be suppressed
-        # when GHL fires two different webhook events for the same SMS (common
-        # with workflow automations) — second one had a different event_id so
-        # tier-1 passed it, but tier-2 content-deduped it inside the minute.
-        _ghl_msg_id = parsed.get("event_id", "")   # messageId/webhookId from GHL
-        _is_dup, _dup_reason = is_duplicate_inbound(contact_id, inbound_text, ghl_message_id=_ghl_msg_id)
-        print(
-            f"[DEDUP] {'SKIPPED' if _is_dup else 'ALLOWED'} | {_dup_reason} | contact={contact_id}",
-            flush=True,
-        )
-        if _is_dup:
-            log.info(f"[{contact_id}] Duplicate inbound — skipping | {_dup_reason}")
-            return JSONResponse({
-                "status"         : "success",
-                "skipped"        : True,
-                "reason"         : "duplicate",
-                "skip_reason"    : "duplicate_inbound",
-                "dedup_reason"   : _dup_reason,
-                "sms_sent"       : False,
-                "send_sms_called": False,
-            })
+        # Inbound dedup already ran universally above — no per-path check needed here.
 
         # ── Enrich state ──────────────────────────────────────────
         state = get_state(contact_id)
