@@ -1432,6 +1432,11 @@ def is_already_booked(tags: list[str]) -> bool:
             return True
         if "appointment" in t and "confirmed" in t:
             return True
+        # Post-flow tags — contact is past booking stage
+        # GHL stamps these after bill is received and flow completes.
+        # Present in Customer Replied webhooks even after a server restart wipes state.
+        if t in ("bill_received", "flow_complete", "bill_received_confirmed"):
+            return True
     return False
 
 
@@ -3762,7 +3767,11 @@ async def inbound_webhook(request: Request):
         _tag_says_booked       = is_already_booked(tags)            # [FIX-2] flexible helper
         _state_says_booked     = bool(
             _state.get("appointment_booked") or
-            _state["stage"] in (Stage.BOOKED,)
+            _state["stage"] in (Stage.BOOKED,) or
+            # bill_received / final_confirmation_sent mean the contact went through the
+            # full booking → bill-collection flow — definitely past qualification.
+            _state.get("bill_received") or
+            _state.get("final_confirmation_sent")
         )
 
         # ── [FIX-NEW] Chat widget payload detection (tag-independent) ─────
@@ -3940,6 +3949,28 @@ async def inbound_webhook(request: Request):
                 state["appointment_booked"] = True
                 print(f"[BOOKED]  appointment_booked = True  ← stamped now, protects against race condition")
 
+            # ── Restore post-flow flags from GHL tags after server restart ────
+            # When the Render process restarts, _state_store is wiped.  The next
+            # Customer Replied webhook carries GHL contact tags (bill_received,
+            # flow_complete) but state has no memory of prior flags.  Without
+            # restoration, state.bill_reminder_sent=False → bill reminder is sent
+            # again, or state.appointment_booked stays False → wrong routing.
+            # Restoring from tags here is safe and idempotent (OR logic preserves
+            # any already-true flags).
+            _tag_set_lower = {t.lower().strip() for t in tags}
+            if _tag_set_lower & {"bill_received", "flow_complete", "bill_received_confirmed"}:
+                print(
+                    f"[BOOKED]  ♻  State restored from GHL tags (server restart recovery): "
+                    f"bill_reminder_sent, bill_received, final_confirmation_sent → True"
+                )
+                log.info(f"[{contact_id}] BOOKED: state flags restored from tags (post-restart)")
+                state["bill_reminder_sent"]      = True
+                state["bill_received"]            = True
+                state["final_confirmation_sent"]  = True
+                state["appointment_booked"]       = True
+                if state["stage"] not in (Stage.BOOKED, Stage.DNC):
+                    state["stage"] = Stage.BOOKED
+
             # ── [PATH-1/2] Stamp entry_path if not already set ────────
             # entry_path is NEVER overwritten once set.  This prevents a
             # chat-widget lead from being re-classified as a direct booking
@@ -4019,21 +4050,36 @@ async def inbound_webhook(request: Request):
             # Bill reminder has already been sent.  Now we decide what to do
             # with whatever the contact just sent back.
             if state.get("bill_reminder_sent"):
-                if state.get("bill_ack_sent"):
-                    log.info(f"[{contact_id}] Bill ack already sent — silent skip")
-                    print(f"[BOOKED] ⛔  SKIP REASON: bill_ack_sent=True — already acked, nothing to send")
-                    return JSONResponse({
-                        "status"            : "success",
-                        "entered_booked_path": True,
-                        "phone_found"       : bool(state.get("phone") or phone),
-                        "sms_sent"          : False,
-                        "skip_reason"       : "bill_ack_already_sent",
-                    })
-
                 reply_text       = parsed["message"]
                 _has_image       = parsed.get("has_attachment", False)
                 _is_real_inbound = parsed.get("has_real_message", False)
                 _msg_type_raw    = parsed.get("msg_type", "SMS")
+
+                if state.get("bill_ack_sent"):
+                    # Bill ack already sent — only block duplicate images/GHL echoes.
+                    # Real text questions (cost, roof, reschedule) get PATH C answer.
+                    if _has_image or not _is_real_inbound:
+                        _skip_reason = "duplicate_bill_image" if _has_image else "non_real_webhook_after_ack"
+                        log.info(f"[{contact_id}] Bill ack already sent — skipping {_skip_reason}")
+                        print(
+                            f"[BOOKED] ⛔  SKIP REASON: bill_ack_sent=True — {_skip_reason}"
+                            f"\n[BOOKED]   intent=detected_as_non_question | msg={reply_text[:60]!r}"
+                        )
+                        return JSONResponse({
+                            "status"            : "success",
+                            "entered_booked_path": True,
+                            "phone_found"       : bool(state.get("phone") or phone),
+                            "sms_sent"          : False,
+                            "skip_reason"       : _skip_reason,
+                        })
+                    # Real text → fall through to PATH C (booked follow-up)
+                    print(
+                        f"[BOOKED] ⚡ bill_ack_sent=True but real text question — routing to booked follow-up"
+                        f"\n[BOOKED]   intent=post_flow_question | msg={reply_text[:60]!r}"
+                    )
+                    log.info(
+                        f"[{contact_id}] POST-FLOW real text bypasses bill_ack_sent guard: {reply_text[:60]!r}"
+                    )
 
                 # ── [FIX-1/4/5/7] Pre-compute bill submission BEFORE routing ────
                 # Done here so the diagnostic block below can show the result,
