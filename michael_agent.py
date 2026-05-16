@@ -753,9 +753,10 @@ def get_state(contact_id: str) -> dict:
             "location_confirmed"    : False,    # True once service area confirmed
             "monthly_bill"          : "",       # e.g. "$150/month" once parsed
             # Booking / appointment state
-            "qualified"             : False,
-            "booking_detected"      : False,
-            "booking_follow_up_sent": False,
+            "qualified"              : False,
+            "booking_detected"       : False,
+            "booking_follow_up_sent" : False,   # legacy alias — kept for backward compat
+            "booking_followup_sent"  : False,   # authoritative dedup flag for /webhook/booking-followup
             # Booked-contact bill-photo flow
             "bill_reminder_sent"    : False,
             "bill_photo_received"   : False,    # [ADAPT-4]
@@ -2291,38 +2292,86 @@ def _resolve_first_name(first_name: str = "", full_name: str = "") -> str:
     return ""
 
 
-def build_bill_reminder_message(first_name: str = "", full_name: str = "") -> str:
-    """
-    PATH 2 — DIRECT BOOKING.
-    Sent when a contact books directly via the calendar page with no prior SMS conversation.
-    This is likely the first text they've ever received from Michael, so it includes a
-    brief confirmation and introduces the ask naturally.
-    """
-    first    = _resolve_first_name(first_name, full_name)
-    greeting = f"Hey {first}!" if first else "Hey!"
-    return (
-        f"{greeting} You're all booked — I'll come by your home for about 30 minutes, "
-        f"no cost, no pressure. "
-        f"One quick favor before I get there: can you send over a photo of your most recent "
-        f"Ameren bill? Helps me review the real numbers ahead of time 👍"
-    )
+# ─────────────────────────────────────────────────────────────────────────────
+#  SINGLE SOURCE OF TRUTH: BRAND CONFIG + BOOKING MESSAGE TEMPLATES
+#
+#  ALL customer-facing copy for booking confirmations lives here.
+#  No brand names, utility names, or booking SMS copy belong anywhere else.
+#  When branding or messaging changes, update BRAND and BOOKING_TEMPLATES only.
+# ─────────────────────────────────────────────────────────────────────────────
+
+BRAND: dict[str, str] = {
+    "name"          : "STL Energy Advisors",
+    "agent"         : "Michael",
+    "utility"       : "Ameren",
+    "service_area"  : "St. Louis metro",
+    "visit_duration": "about 30 minutes",
+    "visit_cost"    : "no cost, no pressure",
+}
+
+# Booking SMS templates keyed by variant name.
+# Rendered exclusively by build_booking_message() — never interpolated inline.
+BOOKING_TEMPLATES: dict[str, str] = {
+    # PATH 2 — Direct calendar booking.
+    # First text the contact receives from Michael.  Brief confirmation + bill ask.
+    "direct_booking": (
+        "{greeting} You're all set — I'll stop by your home for {visit_duration}, "
+        "{visit_cost}. "
+        "One favor before I get there: snap a photo of your latest {utility} bill "
+        "and send it my way — helps me run your numbers ahead of the visit 👍"
+    ),
+    # PATH 1 — Chat-widget lead who already knows Michael from the SMS flow.
+    # Warm continuation — no re-introduction needed.
+    "sms_flow": (
+        "Perfect{name_suffix}, you're all set! "
+        "Send over a photo of your most recent {utility} bill when you get a chance — "
+        "I'll look it over before I come by 👍"
+    ),
+}
 
 
-def build_bill_reminder_message_sms_flow(first_name: str = "", full_name: str = "") -> str:
+def build_booking_confirmation(
+    variant:    str,
+    first_name: str = "",
+    full_name:  str = "",
+) -> tuple[str, str]:
     """
-    PATH 1 — CHAT WIDGET → SMS FLOW → BOOKED.
-    Sent to contacts who went through the chat widget qualification conversation
-    and THEN booked.  They've already been talking to Michael — this is the
-    next line in the same conversation, not a fresh re-introduction.
-    No name re-greeting, no appointment confirmation — they know they booked.
+    Single entry point for all post-booking confirmation SMS copy.
+
+    Reads exclusively from BRAND and BOOKING_TEMPLATES — no hardcoded strings.
+    Returns (rendered_message, template_key_used) so every caller can log both.
+
+    NOTE: This function sends the confirmation AFTER a contact books.
+          For the SMS that sends the calendar booking link to a qualified lead,
+          use build_booking_message() (defined later in this file).
+
+    Args:
+        variant:    "direct_booking" | "sms_flow"
+                    Falls back to "direct_booking" for unknown / invalid values.
+        first_name: Preferred; resolved via _resolve_first_name.
+        full_name:  Fallback when first_name is blank or invalid.
+
+    Returns:
+        (message_text, template_key)  — template_key is what was actually rendered.
     """
-    first = _resolve_first_name(first_name, full_name)
-    lead  = f" {first}" if first else ""
-    return (
-        f"Perfect{lead}, you're all set! "
-        f"Send over a photo of your most recent Ameren bill when you get a chance — "
-        f"I'll review the real numbers before I come by 👍"
-    )
+    first        = _resolve_first_name(first_name, full_name)
+    template_key = variant if variant in BOOKING_TEMPLATES else "direct_booking"
+    template     = BOOKING_TEMPLATES[template_key]
+
+    if template_key == "direct_booking":
+        rendered = template.format(
+            greeting       = f"Hey {first}!" if first else "Hey!",
+            visit_duration = BRAND["visit_duration"],
+            visit_cost     = BRAND["visit_cost"],
+            utility        = BRAND["utility"],
+        )
+    else:  # sms_flow
+        rendered = template.format(
+            name_suffix = f" {first}" if first else "",
+            utility     = BRAND["utility"],
+        )
+
+    return rendered, template_key
 
 
 _NEGATIVE_REPLY = re.compile(
@@ -4425,22 +4474,19 @@ async def inbound_webhook(request: Request):
 
             # First time seeing this booked contact — send bill reminder.
             # [PATH-1/2] Pick message variant based on entry_path:
-            #   chat_widget    → warm continuation ("Perfect, you're all set!")
-            #   direct_booking → brief intro ("Hey, you're booked!")
+            #   chat_widget    → sms_flow   ("Perfect, you're all set!")
+            #   direct_booking → direct_booking ("Hey! You're all set...")
             #   unknown        → fall back to messages list as secondary signal
             _send_to_number = state.get("phone", "") or phone
             _entry_path     = state.get("entry_path", "unknown")
             _is_chat_widget = (
                 _entry_path == "chat_widget" or
-                # Fallback: if entry_path not set but messages exist, treat as chat widget
                 (_entry_path == "unknown" and bool(state.get("messages")))
             )
-            if _is_chat_widget:
-                reminder = build_bill_reminder_message_sms_flow(first_name=first_name, full_name=full_name)
-                print(f"[BOOKED]  Message variant : PATH-1 SMS-FLOW (entry_path={_entry_path!r} — warm continuation)")
-            else:
-                reminder = build_bill_reminder_message(first_name=first_name, full_name=full_name)
-                print(f"[BOOKED]  Message variant : PATH-2 DIRECT BOOKING (entry_path={_entry_path!r} — brief intro)")
+            _bm_variant             = "sms_flow" if _is_chat_widget else "direct_booking"
+            reminder, _bm_tpl_key   = build_booking_confirmation(_bm_variant, first_name=first_name, full_name=full_name)
+            print(f"[BOOKED]  Message variant    : {_bm_variant!r} | template={_bm_tpl_key!r} | entry_path={_entry_path!r}")
+            print(f"[BOOKED]  Message text       : {reminder!r}")
 
             if not _send_to_number:
                 print(f"[BOOKED] ⚠  WARNING: phone is EMPTY for {full_name!r} ({contact_id})")
@@ -4746,12 +4792,10 @@ async def inbound_webhook(request: Request):
                     _ep2 == "chat_widget" or
                     (_ep2 == "unknown" and bool(state.get("messages")))
                 )
-                if _is_cw_2:
-                    reminder = build_bill_reminder_message_sms_flow(first_name=first_name, full_name=full_name)
-                    print(f"[BOOKED]  Message variant : PATH-1 SMS-FLOW (entry_path={_ep2!r})")
-                else:
-                    reminder = build_bill_reminder_message(first_name=first_name, full_name=full_name)
-                    print(f"[BOOKED]  Message variant : PATH-2 DIRECT BOOKING (entry_path={_ep2!r})")
+                _bm2_variant           = "sms_flow" if _is_cw_2 else "direct_booking"
+                reminder, _bm2_tpl_key = build_booking_confirmation(_bm2_variant, first_name=first_name, full_name=full_name)
+                print(f"[BOOKED]  Message variant    : {_bm2_variant!r} | template={_bm2_tpl_key!r} | entry_path={_ep2!r}")
+                print(f"[BOOKED]  Message text       : {reminder!r}")
                 try:
                     await send_sms_via_ghl(contact_id, reminder, to_number=state.get("phone", "") or phone)
                 except Exception as sms_err:
@@ -5104,23 +5148,20 @@ async def booking_followup(request: Request):
     """
     Appointment-booked confirmation trigger called by GHL when a contact books.
 
-    This endpoint ALWAYS sends the appointment confirmation message.
-    Priority rules:
-      • final_confirmation_sent — BYPASSED (set when bill photo received, not relevant here)
-      • booking_follow_up_sent  — BYPASSED (high-priority override)
-      • daily_limit             — BYPASSED
-      • stage check             — BYPASSED
+    Dedup guards (checked in order — first match wins):
+      1. booking_followup_sent=True  → skip (this endpoint already ran for this booking)
+      2. bill_reminder_sent=True     → skip (inbound webhook already sent the confirmation
+                                       in a race; avoid duplicate)
 
-    The ONE dedup guard kept: if bill_reminder_sent=True AND bill_reminder_sent
-    was just set by /webhook/inbound processing the same booking event moments
-    ago, we skip to avoid an exact-duplicate send.  This is the only suppress
-    condition, and it must be logged clearly.
+    All other guards are bypassed:
+      • final_confirmation_sent — irrelevant here (bill-photo flow, not booking flow)
+      • daily_limit             — booking confirmation is always high-priority
+      • stage check             — bypassed
 
-    Message variant (mirrors the inbound booked path):
-      • entry_path == "chat_widget"  → build_bill_reminder_message_sms_flow()
-        (warm continuation — they already know Michael from the SMS conversation)
-      • entry_path == "direct_booking" or unset → build_bill_reminder_message()
-        (brief intro — first text they've received from Michael)
+    Message copy comes exclusively from BOOKING_TEMPLATES via build_booking_message().
+    Variant selection mirrors the inbound booked path:
+      • entry_path == "chat_widget"         → variant="sms_flow"   (warm continuation)
+      • entry_path == "direct_booking" / unset → variant="direct_booking" (brief intro)
     """
     try:
         try:
@@ -5153,24 +5194,33 @@ async def booking_followup(request: Request):
             state["contact_name"] = full_name
         save_state(contact_id, state)
 
-        # ── Pick message variant based on entry_path ──────────────
+        # ── DEDUP GUARD 1: this endpoint already ran for this booking ─
+        if state.get("booking_followup_sent"):
+            print(
+                f"[BOOKING-FOLLOWUP] ⏭ SKIP dedup=booking_followup_sent | "
+                f"contact={contact_id} | sms_sent=False"
+            )
+            log.info(f"[{contact_id}] booking-followup: skipped — booking_followup_sent already True")
+            return JSONResponse({
+                "status"     : "success",
+                "skipped"    : True,
+                "reason"     : "booking_followup_already_sent",
+                "contact_id" : contact_id,
+            })
+
+        # ── Pick message variant + render via centralized template ─
         _entry_path     = state.get("entry_path", "unknown")
         _is_chat_widget = (
             _entry_path == "chat_widget" or
             (_entry_path == "unknown" and bool(state.get("messages")))
         )
-        if _is_chat_widget:
-            appt_confirmation = build_bill_reminder_message_sms_flow(
-                first_name=first_name, full_name=full_name
-            )
-            _variant = "sms_flow (chat_widget — warm continuation)"
-        else:
-            appt_confirmation = build_bill_reminder_message(
-                first_name=first_name, full_name=full_name
-            )
-            _variant = "direct_booking (first contact — brief intro)"
+        _bf_variant                    = "sms_flow" if _is_chat_widget else "direct_booking"
+        appt_confirmation, _bf_tpl_key = build_booking_confirmation(
+            _bf_variant, first_name=first_name, full_name=full_name
+        )
+        _variant = _bf_variant  # retained for log.info line below
 
-        # ── Diagnostic banner ─────────────────────────────────────
+        # ── Diagnostic banner ──────────────────────────────────────
         print(f"\n[BOOKING-FOLLOWUP] {'─'*50}")
         print(f"[BOOKING-FOLLOWUP]  contact_id             : {contact_id}")
         print(f"[BOOKING-FOLLOWUP]  first_name             : {first_name or '(not set)'!r}")
@@ -5178,18 +5228,21 @@ async def booking_followup(request: Request):
         print(f"[BOOKING-FOLLOWUP]  phone                  : {phone or '(not set)'!r}")
         print(f"[BOOKING-FOLLOWUP]  stage (state)          : {state['stage']}")
         print(f"[BOOKING-FOLLOWUP]  entry_path             : {_entry_path!r}")
-        print(f"[BOOKING-FOLLOWUP]  message_variant        : {_variant}")
+        print(f"[BOOKING-FOLLOWUP]  variant                : {_bf_variant!r}")
+        print(f"[BOOKING-FOLLOWUP]  template_key           : {_bf_tpl_key!r}")
+        print(f"[BOOKING-FOLLOWUP]  brand.name             : {BRAND['name']!r}")
+        print(f"[BOOKING-FOLLOWUP]  brand.utility          : {BRAND['utility']!r}")
         print(f"[BOOKING-FOLLOWUP]  bill_reminder_sent     : {state.get('bill_reminder_sent', False)}")
+        print(f"[BOOKING-FOLLOWUP]  booking_followup_sent  : {state.get('booking_followup_sent', False)}")
         print(f"[BOOKING-FOLLOWUP]  final_confirmation_sent: {state.get('final_confirmation_sent', False)}  ← BYPASSED")
         print(f"[BOOKING-FOLLOWUP]  message                : {appt_confirmation!r}")
         print(f"[BOOKING-FOLLOWUP] {'─'*50}")
 
-        # ── Only dedup: skip if inbound already sent bill reminder
-        # for this same booking event (race condition guard).
+        # ── DEDUP GUARD 2: inbound race — skip if inbound already sent ─
         if state.get("bill_reminder_sent"):
             print(
-                f"[BOOKING-FOLLOWUP]  ⏭ SKIPPED — bill_reminder_sent=True, "
-                f"inbound already sent appointment confirmation for this booking"
+                f"[BOOKING-FOLLOWUP]  ⏭ SKIP dedup=bill_reminder_sent | "
+                f"inbound already sent confirmation for this booking | contact={contact_id}"
             )
             log.info(f"[{contact_id}] booking-followup: skipped — bill_reminder_sent by inbound already")
             return JSONResponse({
@@ -5225,19 +5278,27 @@ async def booking_followup(request: Request):
         elif _sent:
             print(f"[BOOKING-FOLLOWUP SMS RESULT]  ✅ Appointment confirmation sent to {full_name!r} at {phone!r}")
 
-        # Stamp bill_reminder_sent so /webhook/inbound booked path
-        # doesn't double-send if it fires immediately after.
-        state["bill_reminder_sent"]  = True
-        state["bill_requested"]      = True
-        state["appointment_booked"]  = True
+        # Stamp all booking flags so no other path double-sends.
+        # booking_followup_sent → primary dedup for this endpoint on retry/re-fire
+        # bill_reminder_sent    → inbound booked path won't send again
+        state["booking_followup_sent"] = True
+        state["bill_reminder_sent"]    = True
+        state["bill_requested"]        = True
+        state["appointment_booked"]    = True
         increment_message_count(state)
         save_state(contact_id, state)
-        log.info(f"[{contact_id}] Booking-followup appt confirmation sent | variant={_variant!r}")
+        log.info(
+            f"[{contact_id}] Booking-followup confirmation sent | "
+            f"variant={_bf_variant!r} | template={_bf_tpl_key!r} | "
+            f"brand={BRAND['name']!r} | sent={_sent} | deduped={_deduped}"
+        )
         return JSONResponse({
-            "status"  : "success",
-            "sent"    : _sent,
-            "deduped" : _deduped,
-            "variant" : _variant,
+            "status"       : "success",
+            "sent"         : _sent,
+            "deduped"      : _deduped,
+            "variant"      : _bf_variant,
+            "template_key" : _bf_tpl_key,
+            "brand"        : BRAND["name"],
         })
 
     except Exception as err:
