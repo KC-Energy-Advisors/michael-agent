@@ -790,6 +790,12 @@ def get_state(contact_id: str) -> dict:
             "final_confirmation_sent" : False,
             "source_chat_widget"      : False,
             "source_direct_calendar"  : False,
+            # ── Pending question tracking (v3.6+) ─────────────────────────
+            # Tracks the qualification field the agent most recently asked about.
+            # Used to disambiguate brief yes/no replies and detect duplicate sends.
+            # Values: "utility" | "ownership" | "bill" | "send_booking" | "none"
+            "pending_question"        : "none",
+            "last_outbound_intent"    : "none",
         }
     return _state_store[contact_id]
 
@@ -1816,9 +1822,12 @@ def _detect_homeowner(text: str, stage: Stage, location_confirmed: bool = False)
         return "no"
     if _HOMEOWNER_YES_EXPLICIT.search(text):
         return "yes"
-    # [FIX-8.C] At ASK_OWNERSHIP, brief yes/no is always trusted —
-    # the stage itself proves what question was just asked.
-    if stage == Stage.ASK_OWNERSHIP:
+    # At ASK_OWNERSHIP, brief yes/no is trusted ONLY when location is already confirmed.
+    # If location is not yet confirmed, the pending question was utility (first outreach),
+    # so brief "yes" is a utility confirmation — not homeowner — in that reply.
+    # Requiring location_confirmed=True prevents a single "yes" from simultaneously
+    # setting both utility and ownership when they arrive in separate messages.
+    if stage == Stage.ASK_OWNERSHIP and location_confirmed:
         if _BRIEF_YES.match(text.strip()):
             return "yes"
         if _BRIEF_NO.match(text.strip()):
@@ -1873,20 +1882,25 @@ def update_state_from_inbound(state: dict, inbound_text: str) -> None:
     loc_conf   = bool(state.get("location_confirmed"))
     homeown    = state.get("homeowner")
 
-    # Service area — parse before ownership so location_confirmed is up to date
-    # when _detect_homeowner() decides whether to trust brief yes/no.
+    # Snapshot BEFORE any update this pass.
+    # _detect_homeowner() receives the PRE-update value so a single "yes" cannot
+    # simultaneously confirm location AND ownership in the same inbound message.
+    _loc_conf_before = loc_conf
+
+    # Service area — parse first so location_confirmed is current for logging.
     if _detect_location_confirmed(inbound_text, loc_conf, homeowner_set=homeown is not None):
         state["location_confirmed"] = True
         loc_conf = True
-        print(f"[STATE] 📍 location_confirmed=True parsed from: {inbound_text[:60]!r}")
+        print(f"[STATE] 📍 location_confirmed=True | FIELD_UPDATED=location_confirmed")
 
     # Homeowner — only parse when we haven't confirmed yet.
-    # Pass location_confirmed so brief 'yes' is only trusted after area is confirmed.
+    # Pass PRE-update loc_conf: if "yes" just confirmed utility this pass, it cannot
+    # also confirm homeownership — those are separate questions requiring separate replies.
     if state.get("homeowner") is None:
-        detected = _detect_homeowner(inbound_text, stage, location_confirmed=loc_conf)
+        detected = _detect_homeowner(inbound_text, stage, location_confirmed=_loc_conf_before)
         if detected:
             state["homeowner"] = detected
-            print(f"[STATE] 🏠 homeowner={detected!r} parsed from: {inbound_text[:60]!r}")
+            print(f"[STATE] 🏠 homeowner={detected!r} | FIELD_UPDATED=homeowner")
 
     # Bill — parse any time it's unknown (leads often volunteer this early)
     if not state.get("monthly_bill"):
@@ -2093,11 +2107,13 @@ def build_system_prompt(state: dict) -> str:
         # Legacy stage label for old contacts — utility/area still needs to be answered
         current_goal = "ASK UTILITY — confirm they are an Ameren Missouri customer in the St. Louis area (Missouri side only)."
     else:
-        # New contact or unknown state — ask ownership.
-        # Widget leads always have location_confirmed=True set at first-outreach time,
-        # so this fallback fires only for edge cases (legacy state, manual resets).
-        # Ask ownership first; area will only be needed if loc_conf is explicitly False.
-        current_goal = "ASK OWNERSHIP — find out if they own the home."
+        # Fallback — fires for INITIAL stage, legacy state, or manual resets.
+        # Widget leads have location_confirmed=True from form submission, so if
+        # loc_conf is False here, utility was the unanswered first question.
+        if loc_conf:
+            current_goal = "ASK OWNERSHIP — find out if they own the home."
+        else:
+            current_goal = "ASK UTILITY — confirm they are an Ameren Missouri customer in the St. Louis area (Missouri side only)."
 
     return f"""You are Michael, a solar advisor for STL Energy Advisors, serving St. Louis-area Missouri homeowners on Ameren Missouri.
 Your one job: qualify leads and book them for a free in-home solar consultation.
@@ -2143,7 +2159,7 @@ Never ignore a question by jumping straight to the booking invite.
 • NEVER re-ask about anything listed as confirmed in "WHAT YOU ALREADY KNOW" above
 • If the lead volunteers information before you ask, acknowledge it and move on — never ask again
 • If they ask a question, answer it briefly and naturally, then continue toward your goal
-• If they give a vague reply ("yes", "sure"), infer from conversation context what they're responding to
+• If they give a vague reply ("yes", "sure"), infer from conversation context what they're responding to — NEVER joke or suggest the reply was meant for a different question; rephrase your question instead if unclear
 • "I already booked" / "I just scheduled" → [BOOKED]
 • NEVER repeat "STL Energy Advisors" after the first message
 • NEVER use: "Great!", "Absolutely!", "Of course!", "Certainly!" — too robotic
@@ -3075,7 +3091,18 @@ def michael_agent(contact_id: str, inbound_text: str) -> Optional[str]:
         # NOTE: build_system_prompt() is ONLY called for unbooked contacts.
         # Booked contacts exit via the BOOKED LOCKOUT above.
         system = build_system_prompt(state)
-        print(f"[AGENT] Goal: {_goal_from_prompt(system)}")
+        _current_goal = _goal_from_prompt(system)
+        print(f"[AGENT] Goal: {_current_goal}")
+
+        # Track which qualification question we're about to ask (v3.6+ pending_question).
+        # Persisted so the next inbound turn knows what "yes/no" is responding to.
+        _pq = "none"
+        if "ASK UTILITY" in _current_goal:     _pq = "utility"
+        elif "ASK OWNERSHIP" in _current_goal: _pq = "ownership"
+        elif "ASK BILL" in _current_goal:      _pq = "bill"
+        elif "BOOKING" in _current_goal:       _pq = "send_booking"
+        state["pending_question"] = _pq
+        print(f"[AGENT] PendingQ  : {_pq}")
         print(f"[AGENT] Path: CLAUDE | intent={intent} | history={len(msgs_for_api)} msgs | first_role={msgs_for_api[0]['role'] if msgs_for_api else 'EMPTY'}")
         for i, m in enumerate(msgs_for_api[-6:]):   # log last 6 to keep console readable
             idx     = len(msgs_for_api) - min(6, len(msgs_for_api)) + i
@@ -3155,7 +3182,11 @@ def michael_agent(contact_id: str, inbound_text: str) -> Optional[str]:
             print(f"[AGENT] Stage → {new_stage} (from control tag)")
             log.info(f"[{contact_id}] Stage updated to: {new_stage}")
         elif state["stage"] == Stage.INITIAL:
-            state["stage"] = Stage.ASK_OWNERSHIP
+            # Advance to the correct next stage based on what was confirmed this turn.
+            # If utility/area is now confirmed (loc_conf was just set or was already True),
+            # go to ASK_OWNERSHIP; otherwise go to ASK_LOCATION so the next turn's
+            # system prompt knows the utility question is still pending.
+            state["stage"] = Stage.ASK_OWNERSHIP if state.get("location_confirmed") else Stage.ASK_LOCATION
 
         # ── Infer confirmed facts from stage transitions [ADAPT-3] ─
         # If we advanced past ownership, homeowner is confirmed.
