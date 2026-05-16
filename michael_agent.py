@@ -574,9 +574,11 @@ app.add_middleware(
     allow_origins=[
         "https://kc-energy-advisors-v2.vercel.app",
         "https://kcenergyadvisors.com",
+        "https://stlenergyadvisors.com",
+        "https://www.stlenergyadvisors.com",
         "http://localhost:3000",
     ],
-    allow_origin_regex=r"https://kc-energy-advisors-v2[\w-]*\.vercel\.app",
+    allow_origin_regex=r"https://(kc-energy-advisors-v2[\w-]*\.vercel\.app|stlenergyadvisors\.com)",
     allow_methods=["*"],
     allow_headers=["*"],
     allow_credentials=False,
@@ -2249,13 +2251,15 @@ def is_booking_confirmation(text: str) -> bool: return bool(BOOKED_KEYWORDS.sear
 #  BOOKED-CONTACT MESSAGES
 # ─────────────────────────────────────────────
 
+_INVALID_NAMES = {"unknown", "none", "", "admin", "admin notifications", "notifications"}
+
 def _resolve_first_name(first_name: str = "", full_name: str = "") -> str:
     """Shared name resolution: prefer first_name, fall back to first word of full_name."""
     candidate = first_name.strip() if first_name else ""
-    if candidate and candidate.lower() not in ("unknown", "none", ""):
+    if candidate and candidate.lower() not in _INVALID_NAMES:
         return candidate
     candidate = full_name.strip() if full_name else ""
-    if candidate and candidate.lower() not in ("unknown", "none", ""):
+    if candidate and candidate.lower() not in _INVALID_NAMES:
         return candidate.split()[0]
     return ""
 
@@ -2562,8 +2566,11 @@ def _build_booked_followup_prompt(state: dict) -> str:
 • If they say "thanks" / "sounds good" / "see you then" → reply with "You're all set! See you then 👍" or similar short close.
 • If they ask what to expect → "Just a relaxed 30-minute in-home visit — I'll walk through your Ameren bill, your roof, and the real numbers for your home."
 • If they ask about timing / what to bring → answer naturally and briefly (1-2 sentences max). If they ask what to bring, "Your latest Ameren bill — that's all I need."
+• If they ask about cost / "Is this free?" → "No cost to you for the visit — zero. We only move forward if the numbers make sense for your home. I'll show you everything when I'm there."
+• If they ask about the roof / roof damage → "Panels mount on a rack system that actually seals around the penetrations — most installs extend the roof life. I'll take a look at your roof when I come by."
+• If they want to reschedule → "Of course — just text or call us and we'll find a new time that works. Do mornings or afternoons work better for you generally?"
 • If they express excitement → match the energy briefly, close warmly.
-• If they seem confused → reassure them calmly in 1-2 sentences.
+• If they seem confused or skeptical → reassure them calmly in 1-2 sentences, no pressure.
 
 ━━ STYLE ━━
 • 1-2 sentences max
@@ -2785,15 +2792,23 @@ def michael_agent(contact_id: str, inbound_text: str) -> Optional[str]:
         #  v3.0 fix: booked contacts NEVER reach build_system_prompt().
         # ══════════════════════════════════════════════════════════════
 
-        # ── STOP 0 + 1: Flow complete — absolute no-op ────────────
+        # ── STOP 0 + 1: Flow complete — fall through to booked path ─────
+        # Non-real webhooks and duplicate bill images are already blocked by
+        # PRIORITY GUARDS 0/1 in inbound_webhook().  Any call that reaches this
+        # point is a real text question from the homeowner after the booking/bill
+        # flow completed.  Route it to the booked follow-up path (STOP 6) so
+        # Michael can answer post-appointment questions (cost, roof, rescheduling).
         if state.get("final_confirmation_sent") or state.get("bill_received"):
             print(
-                f"[AGENT] 🔒 FLOW COMPLETE — "
+                f"[AGENT] ℹ  POST-FLOW real text — "
                 f"final_confirmation_sent={state.get('final_confirmation_sent')} | "
-                f"bill_received={state.get('bill_received')} → no reply"
+                f"bill_received={state.get('bill_received')} → continuing to booked follow-up path"
             )
-            log.info(f"[{contact_id}] AGENT hard-stop: flow complete (final_confirmation_sent/bill_received)")
-            return None
+            log.info(
+                f"[{contact_id}] AGENT POST-FLOW: real text question after flow complete — "
+                f"routing to booked follow-up (STOP 6)"
+            )
+            # fall through — STOP 6 (booked lockout) handles it with the right prompt
 
         # ── STOP 2: DNC ───────────────────────────────────────────
         if state["stage"] in (Stage.DNC,):
@@ -3096,6 +3111,38 @@ def michael_agent(contact_id: str, inbound_text: str) -> Optional[str]:
 # ─────────────────────────────────────────────
 #  GHL API HELPERS
 # ─────────────────────────────────────────────
+
+async def fetch_ghl_contact_first_name(contact_id: str) -> str:
+    """
+    Fetch a contact's first name from GHL when the webhook payload doesn't include it.
+    Common in Customer Replied webhooks which often omit contact name fields.
+    Returns the first name string, or "" if the lookup fails or name is invalid.
+    """
+    if not contact_id:
+        return ""
+    url = f"{GHL_API_BASE}/contacts/{contact_id}"
+    headers = {
+        "Authorization": f"Bearer {GHL_API_KEY}",
+        "Content-Type" : "application/json",
+        "Version"      : "2021-07-28",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(url, headers=headers)
+        if r.is_success:
+            contact = r.json().get("contact") or r.json()
+            name = (contact.get("firstName") or "").strip()
+            if name and name.lower() not in _INVALID_NAMES:
+                print(f"[NAME-LOOKUP] 👤 First name resolved from GHL: {name!r} for contact_id={contact_id!r}")
+                return name
+            print(f"[NAME-LOOKUP] ℹ  GHL contact has no usable first name for contact_id={contact_id!r}")
+            return ""
+        print(f"[NAME-LOOKUP] ⚠  GHL contact lookup failed: status={r.status_code} for contact_id={contact_id!r}")
+        return ""
+    except Exception as _name_err:
+        print(f"[NAME-LOOKUP] ⚠  GHL contact lookup exception: {_name_err}")
+        return ""
+
 
 async def fetch_ghl_contact_phone(contact_id: str) -> str:
     """
@@ -3473,6 +3520,15 @@ async def inbound_webhook(request: Request):
         tags             = parsed["tags"]
         lead_source      = parsed["lead_source"]
 
+        # Enrich from GHL API when name is missing — common in Customer Replied webhooks
+        # which often carry only contactId and the message body, no name fields.
+        if (not first_name or first_name.lower() in _INVALID_NAMES) and contact_id and direction == "inbound":
+            _fetched_name = await fetch_ghl_contact_first_name(contact_id)
+            if _fetched_name:
+                first_name = _fetched_name
+                if not full_name or full_name == "Unknown":
+                    full_name = _fetched_name
+
         print(f"[INBOUND] Contact    : {full_name!r} ({contact_id})")
         print(f"[INBOUND] Phone      : {phone or '(not provided)'}")
         print(f"[INBOUND] Direction  : {direction}")
@@ -3585,30 +3641,45 @@ async def inbound_webhook(request: Request):
         _priority_state = get_state(contact_id)
 
         # ── GUARD 0: Final confirmation already sent  [FIX-9] ────────
-        # Once "Perfect, got it. We'll see you then 👍" has been sent,
-        # the flow is 100% complete.  Every subsequent message — including
-        # GHL workflow echoes, attachment notifications, or any other stray
-        # webhook — is silently dropped here.  Nothing will ever send again.
+        # Blocks GHL echoes, synthetic starters, and duplicate bill images.
+        # Real text questions from the homeowner are allowed through so Michael
+        # can answer post-appointment concerns (cost, roof, rescheduling, etc.).
         if _priority_state.get("final_confirmation_sent"):
-            _ri = parsed.get("has_real_message") or parsed.get("has_attachment")
+            _g0_has_real_txt = parsed.get("has_real_message") and not parsed.get("has_attachment")
+            _g0_has_attach   = bool(parsed.get("has_attachment"))
+            _g0_msg          = (parsed.get("message") or "").strip()
+
+            if not _g0_has_real_txt:
+                # Non-real webhook (GHL echo, placeholder) or duplicate bill image → block
+                _g0_block_reason = "duplicate_bill_attachment" if _g0_has_attach else "non_real_webhook"
+                print(
+                    f"\n[GUARD] 🔒 PRIORITY GUARD 0: final_confirmation_sent=True — "
+                    f"blocking {_g0_block_reason}"
+                )
+                log.info(f"[{contact_id}] PRIORITY GUARD 0: final_confirmation_sent — blocking {_g0_block_reason}")
+                return JSONResponse({
+                    "status"      : "success",
+                    "skipped"     : True,
+                    "reason"      : "priority_guard_0_final_confirmation_sent",
+                    "block_reason": _g0_block_reason,
+                    "contact_id"  : contact_id,
+                })
+
+            # Real text question after flow complete → bypass guard, route to booked follow-up
             print(
-                f"\n[GUARD] 🔒 PRIORITY GUARD 0: final_confirmation_sent=True — "
-                f"flow is DONE, ALL outbound permanently blocked "
-                f"({'real inbound' if _ri else 'non-real webhook'})"
+                f"\n[GUARD] ⚡ PRIORITY GUARD 0 BYPASSED — final_confirmation_sent=True "
+                f"but real text question detected"
+                f"\n[GUARD]   intent=post_flow_question | msg={_g0_msg[:60]!r} → booked follow-up"
             )
-            log.info(f"[{contact_id}] PRIORITY GUARD 0: final_confirmation_sent → no-op")
-            return JSONResponse({
-                "status"     : "success",
-                "skipped"    : True,
-                "reason"     : "priority_guard_0_final_confirmation_sent",
-                "contact_id" : contact_id,
-            })
+            log.info(
+                f"[{contact_id}] PRIORITY GUARD 0: bypassed for real post-flow text question: {_g0_msg[:60]!r}"
+            )
+            # fall through to booked follow-up path
 
         # ── GUARD 1: Bill already received — flow complete ────────────
-        # Once the bill has been acked, no future inbound message triggers
-        # ANY outbound response.  Absolute silent no-op.
-        # Catches: duplicate GHL webhooks after bill photo, any stray message
-        #          after the flow is complete.
+        # Blocks duplicate bill-photo webhooks and GHL echoes.
+        # Real text questions from the homeowner are allowed through so Michael
+        # can answer post-appointment concerns (cost, roof, rescheduling, etc.).
         _bill_already_received = (
             _priority_state.get("bill_received") or
             (  # backward compat: older contacts before v2.9 flag was added
@@ -3617,19 +3688,36 @@ async def inbound_webhook(request: Request):
             )
         )
         if _bill_already_received:
-            _ri = parsed.get("has_real_message") or parsed.get("has_attachment")
+            _g1_has_real_txt = parsed.get("has_real_message") and not parsed.get("has_attachment")
+            _g1_has_attach   = bool(parsed.get("has_attachment"))
+            _g1_msg          = (parsed.get("message") or "").strip()
+
+            if not _g1_has_real_txt:
+                # Non-real webhook or duplicate bill image → block
+                _g1_block_reason = "duplicate_bill_attachment" if _g1_has_attach else "non_real_webhook"
+                print(
+                    f"\n[GUARD] 🔒 PRIORITY GUARD 1: bill_received=True — "
+                    f"blocking {_g1_block_reason}"
+                )
+                log.info(f"[{contact_id}] PRIORITY GUARD 1: bill_received — blocking {_g1_block_reason}")
+                return JSONResponse({
+                    "status"      : "success",
+                    "skipped"     : True,
+                    "reason"      : "priority_guard_1_bill_received",
+                    "block_reason": _g1_block_reason,
+                    "contact_id"  : contact_id,
+                })
+
+            # Real text question after bill received → bypass guard, route to booked follow-up
             print(
-                f"\n[GUARD] 🔒 PRIORITY GUARD 1: bill_received=True — "
-                f"flow is complete, ALL outbound blocked "
-                f"({'real inbound' if _ri else 'non-real webhook'})"
+                f"\n[GUARD] ⚡ PRIORITY GUARD 1 BYPASSED — bill_received=True "
+                f"but real text question detected"
+                f"\n[GUARD]   intent=post_flow_question | msg={_g1_msg[:60]!r} → booked follow-up"
             )
-            log.info(f"[{contact_id}] PRIORITY GUARD 1: bill_received → no-op")
-            return JSONResponse({
-                "status"     : "success",
-                "skipped"    : True,
-                "reason"     : "priority_guard_1_bill_received",
-                "contact_id" : contact_id,
-            })
+            log.info(
+                f"[{contact_id}] PRIORITY GUARD 1: bypassed for real post-flow text question: {_g1_msg[:60]!r}"
+            )
+            # fall through to booked follow-up path
 
         # ══ END PRIORITY GUARDS (GUARD 0 + GUARD 1 above) ══════════════
 
@@ -3771,10 +3859,13 @@ async def inbound_webhook(request: Request):
             _state.get("messages") or
             _state["stage"] not in (Stage.INITIAL,)
         )
+        # _state_has_convo is kept for diagnostic logging below but intentionally
+        # NOT used as a routing gate — after a server restart the in-memory store
+        # is empty so _state_has_convo would be False for every real customer reply,
+        # silently dropping their message. Any real inbound message deserves a response.
         _is_inbound_sms_reply = (
             direction == "inbound" and
             bool(_has_real_msg) and
-            _state_has_convo and
             not _is_booked_contact   # booked contacts have their own path
         )
 
