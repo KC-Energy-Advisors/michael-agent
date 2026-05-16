@@ -926,16 +926,43 @@ def normalize_payload(body: dict) -> dict:
         nested.get("state") or nested.get("province") or ""
     )
 
+    # ── Message text extraction — handles both flat and nested GHL formats ──
+    # GHL "Customer Replied" workflow webhooks often send the SMS body in a nested
+    # message object: {"message": {"body": "Yes", "type": "SMS", "direction": "inbound"}}
+    # rather than at the top level.  Without this, body.get("message") returns the
+    # dict, _safe_str() stringifies it, and Claude receives "{'body': 'Yes', ...}" as
+    # the lead's reply — or the message is missed entirely, causing silent drops.
+    _msg_field = body.get("message")
+    if isinstance(_msg_field, dict):
+        # Nested GHL Customer Replied format — extract real text from inside the object
+        _msg_str = _safe_str(
+            _msg_field.get("body") or _msg_field.get("text") or
+            _msg_field.get("content") or _msg_field.get("messageText") or ""
+        )
+        # Also capture nested direction and ID for use below
+        _nested_msg_direction = _safe_str(_msg_field.get("direction") or "").lower()
+        _nested_msg_id        = _safe_str(_msg_field.get("id") or _msg_field.get("messageId") or "")
+    elif isinstance(_msg_field, str):
+        _msg_str              = _msg_field
+        _nested_msg_direction = ""
+        _nested_msg_id        = ""
+    else:
+        _msg_str              = ""
+        _nested_msg_direction = ""
+        _nested_msg_id        = ""
+
     raw_message = _safe_str(
-        body.get("message") or body.get("body") or body.get("text") or
+        _msg_str or
+        body.get("body") or body.get("text") or
         body.get("messageBody") or body.get("message_body") or
-        body.get("smsBody") or body.get("sms_body") or ""
+        body.get("smsBody") or body.get("sms_body") or
+        body.get("content") or body.get("messageText") or body.get("message_text") or
+        ""
     )
+
     # [FIX-3.3] has_real_message is True ONLY for genuine human-typed messages.
     # Placeholder values like "start" are injected by GHL for form submissions
     # and chat widget initiations — they are NOT real SMS replies.
-    # Treating them as real messages caused is_chat_widget_lead_payload() to
-    # reject legitimate widget leads with "has_real_message=True (live SMS reply)".
     has_real_message = bool(raw_message) and not is_placeholder_widget_message(raw_message)
     message = raw_message if raw_message else "start"
 
@@ -967,7 +994,7 @@ def normalize_payload(body: dict) -> dict:
 
     direction = _safe_str(
         body.get("direction") or body.get("messageDirection") or
-        body.get("message_direction") or "inbound"
+        body.get("message_direction") or _nested_msg_direction or "inbound"
     ).lower()
 
     booking_detected = any(
@@ -1000,6 +1027,7 @@ def normalize_payload(body: dict) -> dict:
         body.get("messageId")  or body.get("message_id") or
         body.get("eventId")    or body.get("event_id")   or
         body.get("webhookId")  or body.get("webhook_id") or
+        _nested_msg_id or  # extracted from body["message"]["id"] for nested GHL format
         ""
         # body.get("id")    ← FORBIDDEN: may be contact ID
         # nested.get("id")  ← FORBIDDEN: may be contact ID
@@ -3647,6 +3675,42 @@ async def inbound_webhook(request: Request):
         if custom_fields:
             print(f"[INBOUND] Custom fields: {custom_fields}")
 
+        # ── PIPELINE TRACE — message extraction diagnostic ────────────────
+        # Confirms exactly which field the SMS text was found in.
+        # If "nested_msg_obj" → GHL Customer Replied format; text came from body["message"]["body"].
+        # If direction=inbound but has_real_message=False → message field missing or unrecognized.
+        _msg_body_field_raw = body.get("message")
+        _msg_src = (
+            "nested_msg_obj (body[message][body])" if isinstance(_msg_body_field_raw, dict) else
+            "body[message]"  if isinstance(_msg_body_field_raw, str) and _msg_body_field_raw else
+            "body[body]"     if body.get("body") else
+            "body[text]"     if body.get("text") else
+            "body[messageBody]" if body.get("messageBody") else
+            "body[content]"  if body.get("content") else
+            "(not found — all fields empty)"
+        )
+        _msg_extracted = parsed.get("message", "")
+        print(
+            f"[PIPELINE] ── MESSAGE EXTRACTION TRACE ──────────────────────────\n"
+            f"[PIPELINE]  source_field    : {_msg_src}\n"
+            f"[PIPELINE]  extracted_msg   : {_msg_extracted!r}\n"
+            f"[PIPELINE]  has_real_message: {parsed.get('has_real_message')}\n"
+            f"[PIPELINE]  direction       : {direction}\n"
+            f"[PIPELINE]  contact_id      : {contact_id}\n"
+            f"[PIPELINE]  stage           : {get_state(contact_id)['stage']}\n"
+            f"[PIPELINE] ────────────────────────────────────────────────────────",
+            flush=True,
+        )
+        if direction == "inbound" and not parsed.get("has_real_message"):
+            _loud(
+                f"[PIPELINE] ⚠ INBOUND SMS with no recognized message body!\n"
+                f"[PIPELINE]   contact={contact_id} | msg_src={_msg_src}\n"
+                f"[PIPELINE]   Raw body[message] type: {type(_msg_body_field_raw).__name__}\n"
+                f"[PIPELINE]   Raw body[message] value: {str(_msg_body_field_raw)[:200]!r}\n"
+                f"[PIPELINE]   All body keys: {sorted(body.keys()) if body else []}\n"
+                f"[PIPELINE]   This message will NOT be processed unless routing allows it!"
+            )
+
         # ── [PATH-1/2] Register phone → contact_id for continuity ────
         # Done before any routing so we always capture the chat-widget CID.
         # This is what lets the phone-based lookup below find the right state
@@ -4836,9 +4900,27 @@ async def inbound_webhook(request: Request):
                 return JSONResponse({"status": "success", "replied": True, "reply": reminder, "payload_type": "form_submission_booking_confirmed"})
 
             else:
-                # Contact already active at some other stage — silent skip
-                print(f"[ROUTING] Form submission for contact at stage={state['stage']} — skipping (already active)")
-                return JSONResponse({"status": "success", "skipped": True, "reason": "form_submission_contact_already_active"})
+                # Contact already active at some other stage.
+                # Critical guard: if direction=inbound with a real message, this could be an
+                # inbound reply that was misclassified as form_submission because the SMS body
+                # was in a nested body["message"]["body"] field (GHL Customer Replied format)
+                # rather than a top-level field that _safe_str() would parse as a string.
+                # Fall through to the chat-widget reply handler instead of silently dropping.
+                if direction == "inbound" and parsed.get("has_real_message"):
+                    _loud(
+                        f"[PIPELINE] ⚠ INBOUND-FALLTHROUGH: form_submission classified but "
+                        f"direction=inbound + has_real_message=True at stage={state['stage']} — "
+                        f"routing to michael_agent() instead of silent drop | contact={contact_id}"
+                    )
+                    log.warning(
+                        f"[{contact_id}] INBOUND-FALLTHROUGH: form_submission at stage={state['stage']} "
+                        f"has_real_message=True — routing to michael_agent() (possible GHL nested msg format)"
+                    )
+                    # Do NOT return — fall through to the chat-widget reply handler below
+                else:
+                    print(f"[ROUTING] Form submission for contact at stage={state['stage']} — skipping (already active)")
+                    log.info(f"[{contact_id}] form_submission_contact_already_active | stage={state['stage']} | direction={direction}")
+                    return JSONResponse({"status": "success", "skipped": True, "reason": "form_submission_contact_already_active"})
 
         # ── Chat widget: real inbound SMS ─────────────────────────
         msg_type = "lead"
@@ -5036,6 +5118,41 @@ async def inbound_webhook(request: Request):
             print(f"[REPLY]      • Claude API error (see [AGENT] lines above)", flush=True)
             print(f"[REPLY]      • flow already complete (final_confirmation_sent/bill_received)", flush=True)
             log.warning(f"[{contact_id}] michael_agent() returned None | stage={_post_stage}")
+
+            # ── [FAILSAFE] Send recovery message for unexpected None ──────────
+            # If this was a real inbound SMS to an active (non-terminal) contact and
+            # the agent returned None for a non-intentional reason (Claude error, limit
+            # glitch, etc.), send a soft recovery message so the lead isn't left in silence.
+            # Intentional silences (DNC, DISQUALIFIED) are excluded.
+            _failsafe_terminal = {Stage.DNC, Stage.DISQUALIFIED}
+            _post_stage_val    = _post_state["stage"]
+            _failsafe_intended_silence = (
+                _post_stage_val in _failsafe_terminal or
+                _post_state.get("final_confirmation_sent") or
+                _post_state.get("bill_received")
+            )
+            if direction == "inbound" and bool(_has_real_msg) and not _failsafe_intended_silence:
+                _failsafe_msg   = "Sorry — had a small tech hiccup on my end. Mind sending that one more time?"
+                _failsafe_phone = _post_state.get("phone", "") or phone
+                print(f"[FAILSAFE] ⚡ Sending recovery SMS — agent returned None for real inbound | stage={_post_stage_val}", flush=True)
+                log.warning(f"[{contact_id}] FAILSAFE: sending tech hiccup SMS (agent None, stage={_post_stage_val})")
+                if not is_duplicate_outbound(contact_id, _failsafe_msg):
+                    try:
+                        await send_sms_via_ghl(contact_id, _failsafe_msg, to_number=_failsafe_phone)
+                        print(f"[FAILSAFE] ✅ Recovery SMS sent to {full_name!r} ({contact_id})", flush=True)
+                    except Exception as _fs_err:
+                        print(f"[FAILSAFE] ❌ Recovery SMS failed: {_fs_err}", flush=True)
+                        log.error(f"[{contact_id}] FAILSAFE send failed: {_fs_err}")
+                else:
+                    print(f"[FAILSAFE] ⚠ Recovery SMS suppressed by outbound dedup", flush=True)
+            else:
+                print(
+                    f"[FAILSAFE] ℹ No recovery SMS — "
+                    f"intended_silence={_failsafe_intended_silence} | "
+                    f"direction={direction} | has_real_msg={bool(_has_real_msg)}",
+                    flush=True,
+                )
+
             return JSONResponse({
                 "status"         : "success",
                 "replied"        : False,
