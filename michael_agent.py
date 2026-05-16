@@ -485,7 +485,7 @@ SETUP
     GHL_API_KEY=your_ghl_api_key
     GHL_LOCATION_ID=your_location_id
     GHL_FROM_NUMBER=+18163190932
-    BOOKING_LINK=https://api.leadconnectorhq.com/widget/booking/0fu9WVucPWOYhM0tSEGE
+    BOOKING_LINK=https://stlenergyadvisors.com/get-solar-info?source=sms
     BOOKED_TAG=appointment booked
     PORT=8000
 """
@@ -666,7 +666,7 @@ async def _startup_diagnostic():
 # This hardcoded constant is what EVERY outbound booking SMS must use.
 # It is also what sanitize_outbound_message() replaces bad URLs WITH — so it
 # must be correct regardless of what .env contains.
-_CORRECT_BOOKING_URL = "https://api.leadconnectorhq.com/widget/booking/0fu9WVucPWOYhM0tSEGE"
+_CORRECT_BOOKING_URL = "https://stlenergyadvisors.com/get-solar-info?source=sms"
 
 # BOOKING_LINK is the runtime variable used throughout the module.
 # We read from .env for flexibility, but immediately override any bad value.
@@ -677,13 +677,13 @@ BOOKING_LINK = os.getenv("BOOKING_LINK", _CORRECT_BOOKING_URL)
 # so the bad URL flowed into every booking SMS for the entire process lifetime.
 # Now we override BOOKING_LINK to _CORRECT_BOOKING_URL immediately.
 #
-# Post-STL-migration: the live URL IS a leadconnectorhq.com widget URL, so the
-# old `leadconnectorhq.com/widget/booking` substring match would falsely flag
-# the live URL itself. Updated to match only the LEGACY kcenergyadvisors.com
-# booking path (the previous KC-era calendar URL).
+# Any .env that still contains a raw LeadConnector widget URL or the legacy
+# kcenergyadvisors.com calendar URL is self-healed to the clean public URL.
 _OLD_BOOKING_DOMAINS = (
-    "kcenergyadvisors.com/get-solar-info",     # legacy KC-era calendar URL
-    "kcenergyadvisors.net/get-solar-info",     # legacy alt-domain variant
+    "kcenergyadvisors.com/get-solar-info",         # legacy KC-era calendar URL
+    "kcenergyadvisors.net/get-solar-info",         # legacy alt-domain variant
+    "api.leadconnectorhq.com/widget/booking",      # raw GHL widget — never customer-facing
+    "leadconnectorhq.com/widget/booking",          # non-subdomain variant
 )
 if any(old in BOOKING_LINK for old in _OLD_BOOKING_DOMAINS):
     log.warning("=" * 70)
@@ -2156,7 +2156,7 @@ Never ignore a question by jumping straight to the booking invite.
 • "How much does solar cost?" → "I wish I could give you a simple number — it really depends on your home, usage, and how your system gets set up. You're not buying solar so much as replacing your Ameren bill with something fixed. Do you own your home?"
 • "Is this a scam?" → "Legit question — STL Energy Advisors is a licensed local solar firm serving the Missouri side of the St. Louis area. Free in-home review, zero obligation."
 • "Can someone call me?" → "Totally — easiest way is to grab a time here and I'll come by your home.
-   https://api.leadconnectorhq.com/widget/booking/0fu9WVucPWOYhM0tSEGE"
+   https://stlenergyadvisors.com/get-solar-info?source=sms"
 • "Is the tax credit still available?" → "That specific credit expired recently, but incentives can change depending on timing and location — that's something we check when we look at your actual home."
 • "How much will I save?" → "Hard to say without looking at your actual Ameren usage — that's exactly what the in-home review figures out, and if it doesn't pencil out I'll tell you straight."
 • Persistent hesitation → "There's no commitment — it's just a real look at whether solar actually makes sense for your home and your Ameren bill."
@@ -2760,25 +2760,22 @@ def build_booking_message(first_name: str = "", full_name: str = "") -> str:
 #   2. send_sms_via_ghl() — right before the HTTP call
 # ─────────────────────────────────────────────
 
-# Matches LeadConnector widget booking URLs that are NOT our live STL booking link.
-# The negative lookahead exempts the current correct booking ID so the live URL
-# passes through the sanitizer unchanged. Any OTHER widget/booking ID — a stale
-# KC-era widget, a hallucinated ID, etc. — is replaced with _CORRECT_BOOKING_URL.
+# Matches ALL LeadConnector widget URLs — any subdomain, any booking/widget path.
+# The raw api.leadconnectorhq.com domain must never appear in customer-facing SMS.
+# Every match is replaced with _CORRECT_BOOKING_URL (the clean public URL).
 _BAD_BOOKING_URL_RE = re.compile(
-    r'https?://[a-zA-Z0-9._-]*leadconnectorhq\.com/widget/booking/'
-    r'(?!0fu9WVucPWOYhM0tSEGE\b)'
-    r'[^\s"\'<>]*',
+    r'https?://[a-zA-Z0-9._-]*leadconnectorhq\.com/widget/[^\s"\'<>]*',
     re.IGNORECASE,
 )
 
 
 def sanitize_outbound_message(text: str, contact_id: str = "") -> str:
     """
-    [FIX-6] Detect and replace any LeadConnector booking URL in outbound text.
+    [FIX-6] Detect and replace any LeadConnector widget URL in outbound text.
 
-    If a bad URL is found it is replaced with BOOKING_LINK and a warning is
-    logged so the source can be tracked down.  The function is idempotent —
-    if the message is already clean it is returned unchanged at zero cost.
+    If a raw leadconnectorhq.com/widget URL is found it is replaced with the
+    clean public booking URL and the replacement is logged. Idempotent — clean
+    messages pass through at zero cost.
     """
     if not _BAD_BOOKING_URL_RE.search(text):
         return text   # fast path — nothing to do
@@ -2787,10 +2784,11 @@ def sanitize_outbound_message(text: str, contact_id: str = "") -> str:
     # itself is wrong (stale .env, race condition) this still produces a safe message.
     fixed = _BAD_BOOKING_URL_RE.sub(_CORRECT_BOOKING_URL, text)
     tag   = f"[{contact_id}] " if contact_id else ""
+    print(f"BOOKING_LINK_SANITIZED=true | contact={contact_id or '(unknown)'}")
     log.warning(
-        f"{tag}[SANITIZE] ⚠️  Bad LeadConnector booking URL detected in outbound message — replaced with BOOKING_LINK"
+        f"{tag}[SANITIZE] ⚠️  Raw LeadConnector URL detected in outbound message — replaced with clean booking URL"
     )
-    print(f"[SANITIZE] ⚠️  Bad booking URL found in outbound message{' for ' + contact_id if contact_id else ''}!")
+    print(f"[SANITIZE] ⚠️  Raw LeadConnector URL found{' for ' + contact_id if contact_id else ''}!")
     print(f"[SANITIZE]    Before : {text[:200]!r}")
     print(f"[SANITIZE]    After  : {fixed[:200]!r}")
     return fixed
@@ -5490,7 +5488,7 @@ SOLAR FACTS — USE THESE, DON'T INVENT NUMBERS
 - Service area: Missouri side of the St. Louis metro only — St. Louis County, St. Charles, Jefferson,
   Franklin, Lincoln, Warren counties, and surrounding Missouri-side areas. We do NOT serve Illinois,
   rural co-ops, or non-Ameren utilities.
-- Booking link: https://api.leadconnectorhq.com/widget/booking/0fu9WVucPWOYhM0tSEGE
+- Booking link: https://stlenergyadvisors.com/get-solar-info?source=sms
   Always send the URL on its own line, no markdown, no parentheses or punctuation directly after.
   Never tell them to text you.
 
@@ -5528,7 +5526,7 @@ No pitch, no pressure. Want me to send you the link to grab a time?"
 
 After offering, if they say yes → give them the direct link immediately, with the URL on its own line:
 "Here's the link to grab a time:
-https://api.leadconnectorhq.com/widget/booking/0fu9WVucPWOYhM0tSEGE
+https://stlenergyadvisors.com/get-solar-info?source=sms
 
 No prep needed — bring your latest Ameren bill and we'll review the real numbers."
 Output the full URL exactly as written above. Do not paraphrase it. Do not wrap it in markdown,
@@ -5579,7 +5577,7 @@ HARD RULES — THESE OVERRIDE EVERYTHING ABOVE
   The next step is always an in-home visit using the booking link.
 - NEVER tell someone to "text me" or give the phone number as a first option.
   Always direct to the booking URL on its own line:
-  https://api.leadconnectorhq.com/widget/booking/0fu9WVucPWOYhM0tSEGE
+  https://stlenergyadvisors.com/get-solar-info?source=sms
 - NEVER say "free electricity", "the bill goes away", or anything that implies the Ameren bill disappears.
 - NEVER give specific savings amounts, dollar ranges, or percentages.
   No "$X/month", no "save 30%", no "cut your bill in half", no ranges like "$90–$120".
