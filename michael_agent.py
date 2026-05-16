@@ -2,7 +2,7 @@
 michael_agent.py  ·  v3.8  (dedup rewrite: 8-second window + GHL message-ID tier)
 ────────────────────────────────────────────────────────────────────────────────
 STL Energy Advisors — AI Appointment-Setting Agent
-  (customer-facing brand: STL Energy Advisors, a division of KC Energy Advisors)
+  (customer-facing brand: STL Energy Advisors)
 Agent Name : Michael
 Model      : Claude (claude-opus-4-6)
 Platform   : GoHighLevel (GHL) via inbound webhook
@@ -2153,7 +2153,7 @@ Never ignore a question by jumping straight to the booking invite.
 ━━ OBJECTIONS ━━
 • "Not interested" → "No worries — if that ever changes, we're here." [DISQUALIFY:NOT_INTERESTED]
 • "How much does solar cost?" → "I wish I could give you a simple number — it really depends on your home, usage, and how your system gets set up. You're not buying solar so much as replacing your Ameren bill with something fixed. Do you own your home?"
-• "Is this a scam?" → "Legit question — STL Energy Advisors (a division of KC Energy Advisors) is a licensed local solar firm serving the Missouri side of the St. Louis area. Free in-home review, zero obligation."
+• "Is this a scam?" → "Legit question — STL Energy Advisors is a licensed local solar firm serving the Missouri side of the St. Louis area. Free in-home review, zero obligation."
 • "Can someone call me?" → "Totally — easiest way is to grab a time here and I'll come by your home.
    https://api.leadconnectorhq.com/widget/booking/0fu9WVucPWOYhM0tSEGE"
 • "Is the tax credit still available?" → "That specific credit expired recently, but incentives can change depending on timing and location — that's something we check when we look at your actual home."
@@ -5343,7 +5343,7 @@ async def health():
 
 # ── Website chat system prompt ────────────────────────────────────────────────
 # Powers the live phone-UI chat on the STL Energy Advisors website
-# (a division of KC Energy Advisors LLC; backend domain remains kcenergyadvisors.com).
+# (STL Energy Advisors; backend domain remains kcenergyadvisors.com).
 #
 # Design philosophy: every reply follows Answer → Context → Question.
 # Qualification happens naturally across the conversation, not as a form.
