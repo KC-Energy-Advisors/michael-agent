@@ -502,6 +502,7 @@ from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Optional
+import asyncio
 from urllib.parse import parse_qs
 
 import httpx
@@ -1692,6 +1693,59 @@ def _is_duplicate_event_id(event_id: str) -> bool:
 
     _processed_event_ids.add(event_id)
     return False
+
+
+# ─────────────────────────────────────────────
+#  PER-CONTACT PROCESSING LOCK + INBOUND DEBOUNCE
+#
+#  Root cause of duplicate replies / race conditions:
+#  FastAPI's asyncio event loop handles multiple concurrent webhook requests.
+#  Between any `await` point in inbound_webhook, a SECOND coroutine for the
+#  SAME contact can advance past the dedup checks and reach michael_agent()
+#  before the first coroutine has saved state.  Result: two calls to
+#  michael_agent() with identical pre-transition state → two outbound SMS.
+#
+#  Fix 1 — Per-contact asyncio.Lock:
+#    One lock per contact_id, stored in _contact_processing_locks.
+#    Before any state read or michael_agent() call, the handler checks:
+#      • if locked → drop immediately (another coroutine is processing)
+#      • if free   → acquire → process → release in finally
+#    asyncio.Lock is single-threaded-safe: check + acquire is atomic because
+#    there is no `await` between them (the event loop cannot interleave).
+#    TTL: handled by the finally block — lock always released after processing.
+#
+#  Fix 2 — Post-completion debounce:
+#    After the lock is released (processing complete + SMS sent), a 2-second
+#    window suppresses any new trigger for the same contact.  Covers the edge
+#    case where GHL fires a delayed second webhook AFTER processing finishes
+#    (the lock is free but the state update is brand-new).  2 seconds is safe
+#    because it takes a human 3-15+ seconds to read a received SMS and reply.
+# ─────────────────────────────────────────────
+
+# contact_id → asyncio.Lock  (one lock per contact, created on first access)
+_contact_processing_locks: dict[str, asyncio.Lock] = {}
+
+# contact_id → monotonic timestamp of when we last completed processing
+_contact_last_processed_ts: dict[str, float] = {}
+_INBOUND_DEBOUNCE_SECS = 2.0   # seconds to suppress after processing completes
+
+
+def _get_or_create_contact_lock(contact_id: str) -> asyncio.Lock:
+    if contact_id not in _contact_processing_locks:
+        _contact_processing_locks[contact_id] = asyncio.Lock()
+    return _contact_processing_locks[contact_id]
+
+
+def _is_debounced(contact_id: str) -> tuple[bool, float]:
+    """Return (is_debounced, elapsed_secs) for logging."""
+    last    = _contact_last_processed_ts.get(contact_id, 0.0)
+    elapsed = _time_module.monotonic() - last
+    return elapsed < _INBOUND_DEBOUNCE_SECS, elapsed
+
+
+def _mark_contact_processed(contact_id: str) -> None:
+    """Called from the finally block each time inbound_webhook completes for a contact."""
+    _contact_last_processed_ts[contact_id] = _time_module.monotonic()
 
 
 # ─────────────────────────────────────────────
@@ -3545,6 +3599,11 @@ async def inbound_webhook(request: Request):
     _loud(f"All headers  : {dict(request.headers)}")
     _loud("=== END WEBHOOK HIT ===")
 
+    # Declared before outer try so the finally block can always reach them,
+    # regardless of which code path returns or which exception fires.
+    _proc_lock  = None   # asyncio.Lock assigned after contact_id is resolved
+    _lock_acq   = False  # True only after await _proc_lock.acquire() succeeds
+
     try:
         # ══════════════════════════════════════════════════════════════
         # STEP 1 — MULTI-STRATEGY BODY PARSE
@@ -3823,6 +3882,54 @@ async def inbound_webhook(request: Request):
                     "dedup_reason": _ud_reason,
                     "contact_id"  : contact_id,
                 })
+
+        # ── [CONCURRENCY-1] Inbound debounce ─────────────────────────────
+        # Suppresses a new inbound trigger if we completed processing for this
+        # contact within the last 2 seconds.  Covers the edge case where GHL
+        # fires a delayed second webhook AFTER the first finishes (the lock is
+        # already free but state was just written).  Human reply latency is
+        # always 3+ seconds, so a 2-second window never blocks legitimate replies.
+        if direction == "inbound" and parsed.get("has_real_message"):
+            _deb, _deb_elapsed = _is_debounced(contact_id)
+            if _deb:
+                print(
+                    f"[DEBOUNCE] ⏱ {contact_id} — {_deb_elapsed:.3f}s since last process "
+                    f"(window={_INBOUND_DEBOUNCE_SECS}s) — suppressing rapid trigger",
+                    flush=True,
+                )
+                log.info(f"[{contact_id}] Debounce suppressed ({_deb_elapsed:.3f}s < {_INBOUND_DEBOUNCE_SECS}s)")
+                return JSONResponse({
+                    "status"      : "success",
+                    "skipped"     : True,
+                    "reason"      : "inbound_debounce",
+                    "elapsed_secs": round(_deb_elapsed, 3),
+                    "contact_id"  : contact_id,
+                })
+
+        # ── [CONCURRENCY-2] Per-contact processing lock ───────────────────
+        # Prevents concurrent michael_agent() calls for the same contact.
+        # check + acquire is atomic within asyncio's single-threaded event loop
+        # (no `await` between them means no other coroutine can interleave).
+        # The lock is released in the `finally` block at the end of this function,
+        # regardless of which code path returns or which exception fires.
+        _proc_lock = _get_or_create_contact_lock(contact_id)
+        if _proc_lock.locked():
+            print(
+                f"[LOCK] ⚡ {contact_id} processing lock HELD — "
+                f"concurrent trigger suppressed (another coroutine is mid-process)",
+                flush=True,
+            )
+            log.warning(f"[{contact_id}] Processing lock held — concurrent duplicate suppressed")
+            return JSONResponse({
+                "status"    : "success",
+                "skipped"   : True,
+                "reason"    : "contact_processing_locked",
+                "contact_id": contact_id,
+            })
+
+        await _proc_lock.acquire()
+        _lock_acq = True
+        print(f"[LOCK] 🔒 {contact_id} lock acquired — processing serialized", flush=True)
 
         # ══════════════════════════════════════════════════════════════
         #  PRIORITY ROUTING GUARDS  [FIX-7 / FIX-9]
@@ -5283,6 +5390,16 @@ async def inbound_webhook(request: Request):
             "error_message": str(fatal_err),
             "traceback"    : _tb,
         })
+    finally:
+        # Always release the per-contact lock, regardless of return path or exception.
+        # Also marks the contact's last-processed timestamp so the 2-second debounce
+        # window starts counting from NOW (after SMS is sent, not before).
+        # _lock_acq is True ONLY after acquire() succeeded, which only happens after
+        # contact_id is fully resolved — so contact_id is always in scope here.
+        if _lock_acq and _proc_lock is not None:
+            _proc_lock.release()
+            _mark_contact_processed(contact_id)  # noqa: F821 — always in scope when _lock_acq=True
+            print(f"[LOCK] 🔓 lock released + debounce started | contact={contact_id}", flush=True)
 
 
 # ─────────────────────────────────────────────
