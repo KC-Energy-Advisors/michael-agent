@@ -732,6 +732,39 @@ class Stage(str, Enum):
 
 
 # ─────────────────────────────────────────────
+#  GHL PIPELINE → STAGE ROUTING
+#
+#  GHL pipeline stage name is the PRIMARY routing driver.
+#  When present it overrides in-memory state for routing decisions.
+#  In-memory state is retained as cache/fallback if GHL API fails.
+# ─────────────────────────────────────────────
+
+GHL_STAGE_MAP: dict[str, Stage] = {
+    "New Lead":                        Stage.INITIAL,
+    "Contacted":                       Stage.ASK_OWNERSHIP,
+    "Qualified":                       Stage.SEND_BOOKING,
+    "Solar Savings Report Scheduled":  Stage.BOOKED,
+    "Consultation Completed":          Stage.BOOKED,
+    "Proposal Sent":                   Stage.BOOKED,
+    "Closed WON":                      Stage.BOOKED,
+    "Closed LOST":                     Stage.DISQUALIFIED,
+}
+
+# Stages that PERMANENTLY suppress opener/qualification logic
+GHL_BOOKED_STAGES: frozenset = frozenset({
+    "Solar Savings Report Scheduled",
+    "Consultation Completed",
+    "Proposal Sent",
+    "Closed WON",
+    "Closed LOST",
+})
+
+def ghl_stage_to_internal(ghl_stage: str) -> "Optional[Stage]":
+    """Map GHL pipeline stage name to internal Stage. Returns None if unmapped."""
+    return GHL_STAGE_MAP.get((ghl_stage or "").strip())
+
+
+# ─────────────────────────────────────────────
 #  IN-MEMORY STATE STORE
 # ─────────────────────────────────────────────
 
@@ -804,6 +837,37 @@ _state_store: dict[str, dict] = {}
 
 def save_state(contact_id: str, state: dict):
     _state_store[contact_id] = state
+
+
+def parse_qualification_tags(tags: list) -> dict:
+    """
+    Extract qualification facts from GHL contact tags to prevent re-asking.
+
+    Tag conventions (lowercase):
+      homeowner, renter
+      ameren-confirmed, ameren-illinois, out-of-area
+      bill-75-99, bill-100-150, bill-150-200, bill-200-plus
+      roof-asphalt, roof-tile, roof-metal, roof-flat
+      timeline-ready, timeline-6months, timeline-1year
+    """
+    result: dict = {}
+    for tag in (tags or []):
+        t = str(tag).lower().strip()
+        if t == "homeowner":
+            result["homeowner"] = "yes"
+        elif t == "renter":
+            result["homeowner"] = "no"
+        elif t == "ameren-confirmed":
+            result["location_confirmed"] = True
+        elif t in ("ameren-illinois", "out-of-area"):
+            result["out_of_area"] = True
+        elif t.startswith("bill-"):
+            result["bill_range"] = t[5:].replace("-", "–")
+        elif t.startswith("roof-"):
+            result["roof_type"] = t[5:]
+        elif t.startswith("timeline-"):
+            result["timeline"] = t[9:]
+    return result
 
 
 # ─────────────────────────────────────────────
@@ -2117,7 +2181,7 @@ def build_process_answer(state: dict) -> str:
 #  the next qualification step or drive booking.
 # ─────────────────────────────────────────────
 
-def build_system_prompt(state: dict) -> str:
+def build_system_prompt(state: dict, ghl_pipeline_stage: str = "", ghl_tags: list | None = None) -> str:
     """
     Build a state-aware system prompt for Michael.
 
@@ -2197,11 +2261,44 @@ def build_system_prompt(state: dict) -> str:
         else:
             current_goal = "ASK UTILITY — confirm they are an Ameren Missouri customer in the St. Louis area (Missouri side only)."
 
+    # ── Tag-based qualification memory ────────────────────────────
+    # GHL tags supplement the stage-based confirmed block with
+    # details collected in previous conversations.
+    _tag_facts = parse_qualification_tags(ghl_tags or [])
+    _tag_lines: list[str] = []
+    if _tag_facts.get("bill_range"):
+        _tag_lines.append(f"✓ BILL RANGE (from tag): ~${_tag_facts['bill_range']}/month — do NOT ask about bill again")
+    if _tag_facts.get("roof_type"):
+        _tag_lines.append(f"✓ ROOF TYPE (from tag): {_tag_facts['roof_type']} — do not ask about roof")
+    if _tag_facts.get("timeline"):
+        _tag_lines.append(f"✓ TIMELINE (from tag): {_tag_facts['timeline']}")
+    if _tag_facts.get("homeowner") and "HOMEOWNER" not in confirmed_block:
+        _tag_lines.append(f"✓ HOMEOWNER (from tag): confirmed — do NOT ask about home ownership again")
+    if _tag_facts.get("location_confirmed") and "SERVICE AREA" not in confirmed_block:
+        _tag_lines.append(f"✓ SERVICE AREA (from tag): confirmed — do NOT ask about utility/area again")
+    if _tag_lines:
+        confirmed_block = confirmed_block + "\n" + "\n".join(f"  {l}" for l in _tag_lines)
+
+    # ── GHL pipeline stage block ───────────────────────────────────
+    _ghl_stage_line = ""
+    if ghl_pipeline_stage:
+        _ghl_stage_line = f"\nGHL PIPELINE STAGE: {ghl_pipeline_stage}\n"
+        # Override CURRENT GOAL if GHL stage tells us something definitive
+        if ghl_pipeline_stage == "Qualified" and "BOOKING" not in current_goal:
+            current_goal = (
+                "BOOKING — contact is marked Qualified in the pipeline. "
+                "Move directly to scheduling. Write ONE natural transition sentence then append [SEND_BOOKING]."
+            )
+        elif ghl_pipeline_stage == "Contacted" and current_goal.startswith("ASK UTILITY"):
+            # 'Contacted' means we already reached them — skip utility re-ask if loc_conf is True
+            if loc_conf:
+                current_goal = "ASK OWNERSHIP — location already confirmed. Find out if they own the home."
+
     return f"""You are Michael, a solar advisor for STL Energy Advisors, serving St. Louis-area Missouri homeowners on Ameren Missouri.
 Your one job: qualify leads and book them for a free in-home solar consultation.
 Text like a calm, helpful, local person — short messages, natural tone, no hype.
 
-━━ WHAT YOU ALREADY KNOW ABOUT THIS LEAD ━━
+{_ghl_stage_line}━━ WHAT YOU ALREADY KNOW ABOUT THIS LEAD ━━
 {confirmed_block}
 
 CURRENT GOAL: {current_goal}
@@ -2719,7 +2816,40 @@ def build_bill_ack_message(first_name: str = "", full_name: str = "") -> str:
 #    not just the code level.
 # ─────────────────────────────────────────────
 
-def _build_booked_followup_prompt(state: dict) -> str:
+def _stage_behavior(ghl_pipeline_stage: str) -> str:
+    """Return stage-specific behavior instructions for the booked follow-up prompt."""
+    s = ghl_pipeline_stage.strip()
+    if s == "Solar Savings Report Scheduled":
+        return (
+            "The appointment is CONFIRMED and SCHEDULED.\n"
+            "Your job: appointment prep and support only.\n"
+            "You may ask if they have their latest Ameren bill ready.\n"
+            "You may confirm timing, location, or what to expect."
+        )
+    elif s == "Consultation Completed":
+        return (
+            "The in-home consultation is DONE.\n"
+            "Your job: post-consult support only — answer questions, handle follow-up.\n"
+            "Do NOT re-pitch, re-qualify, or send a new booking link."
+        )
+    elif s == "Proposal Sent":
+        return (
+            "A proposal has been sent to this homeowner.\n"
+            "Your job: objection handling and decision support.\n"
+            "Answer questions about the proposal honestly. Reduce friction.\n"
+            "Do NOT re-qualify. Do NOT send a new booking link."
+        )
+    elif s in ("Closed WON", "Closed LOST"):
+        return (
+            "This opportunity is CLOSED.\n"
+            "Your job: answer any remaining questions warmly and briefly.\n"
+            "Do NOT restart qualification or send any booking links."
+        )
+    else:
+        return "Appointment is confirmed. Support and appointment prep only."
+
+
+def _build_booked_followup_prompt(state: dict, ghl_pipeline_stage: str = "") -> str:
     """
     [FIX-8/12] Minimal, locked-down Claude system prompt for booked contacts.
 
@@ -2751,6 +2881,11 @@ def _build_booked_followup_prompt(state: dict) -> str:
 • DO NOT say "Based on what you shared" or any qualifying language
 • DO NOT suggest they book — they already booked
 • DO NOT restart the sales flow for any reason
+
+━━ PIPELINE STAGE CONTEXT ━━
+Current GHL pipeline stage: {ghl_pipeline_stage or "Solar Savings Report Scheduled (assumed)"}
+
+{_stage_behavior(ghl_pipeline_stage)}
 
 ━━ WHAT YOU SHOULD DO ━━
 • If they say "thanks" / "sounds good" / "see you then" → reply with "You're all set! See you then 👍" or similar short close.
@@ -2932,7 +3067,7 @@ def increment_message_count(state: dict):
 #  CORE AGENT FUNCTION  [ADAPT-1,2,3]
 # ─────────────────────────────────────────────
 
-def michael_agent(contact_id: str, inbound_text: str) -> Optional[str]:
+def michael_agent(contact_id: str, inbound_text: str, ghl_pipeline_stage: str = "", ghl_tags: list | None = None) -> Optional[str]:
     """
     Main entry point for processing inbound SMS from a lead.
     Returns Michael's reply string, or None if no reply should be sent.
@@ -2953,6 +3088,22 @@ def michael_agent(contact_id: str, inbound_text: str) -> Optional[str]:
         print(f"[AGENT] {'='*50}")
 
         log.info(f"[{contact_id}] Stage={state['stage']} | Inbound: {inbound_text!r}")
+
+        # ── Merge GHL tag facts into state ────────────────────────
+        # Tags carry qualification details from previous conversations.
+        # Apply only if the state doesn't already have that field set.
+        if ghl_tags:
+            _tag_facts = parse_qualification_tags(ghl_tags)
+            if _tag_facts.get("homeowner") and state.get("homeowner") is None:
+                state["homeowner"] = _tag_facts["homeowner"]
+                print(f"[AGENT] 🏷  homeowner from tag: {_tag_facts['homeowner']}", flush=True)
+            if _tag_facts.get("location_confirmed") and not state.get("location_confirmed"):
+                state["location_confirmed"] = True
+                print(f"[AGENT] 🏷  location_confirmed from tag", flush=True)
+            for _tf_key in ("bill_range", "roof_type", "timeline"):
+                if _tag_facts.get(_tf_key) and not state.get(_tf_key):
+                    state[_tf_key] = _tag_facts[_tf_key]
+                    print(f"[AGENT] 🏷  {_tf_key}={_tag_facts[_tf_key]!r} from tag", flush=True)
 
         # ══════════════════════════════════════════════════════════════
         #  michael_agent() HARD STOPS  [FIX-8/9/13]
@@ -3039,8 +3190,15 @@ def michael_agent(contact_id: str, inbound_text: str) -> Optional[str]:
         #   • Any path that somehow calls michael_agent() for a booked contact
         _is_booked_contact = (
             state.get("appointment_booked") or
-            state["stage"] == Stage.BOOKED
+            state["stage"] == Stage.BOOKED or
+            ghl_pipeline_stage in GHL_BOOKED_STAGES
         )
+        if ghl_pipeline_stage in GHL_BOOKED_STAGES and not state.get("appointment_booked"):
+            print(
+                f"[AGENT] 🔒 GHL stage={ghl_pipeline_stage!r} → BOOKED LOCKOUT "
+                f"(overriding internal stage={state['stage']})",
+                flush=True,
+            )
         if _is_booked_contact:
             print(
                 f"\n[AGENT] 🔒 BOOKED LOCKOUT ENGAGED — "
@@ -3062,7 +3220,7 @@ def michael_agent(contact_id: str, inbound_text: str) -> Optional[str]:
                 return _bc_reply
 
             # Build minimal booked-follow-up system prompt — qualification is UNREACHABLE
-            booked_system = _build_booked_followup_prompt(state)
+            booked_system = _build_booked_followup_prompt(state, ghl_pipeline_stage=ghl_pipeline_stage)
 
             # Append message to history — guard against concurrent-webhook race
             # where the same message was already appended by a prior webhook call.
@@ -3188,7 +3346,7 @@ def michael_agent(contact_id: str, inbound_text: str) -> Optional[str]:
         # ── Build dynamic, context-aware system prompt [ADAPT-1] ──
         # NOTE: build_system_prompt() is ONLY called for unbooked contacts.
         # Booked contacts exit via the BOOKED LOCKOUT above.
-        system = build_system_prompt(state)
+        system = build_system_prompt(state, ghl_pipeline_stage=ghl_pipeline_stage, ghl_tags=ghl_tags)
         _current_goal = _goal_from_prompt(system)
         print(f"[AGENT] Goal: {_current_goal}")
 
@@ -3391,6 +3549,52 @@ async def fetch_ghl_contact_phone(contact_id: str) -> str:
     except Exception as _lookup_err:
         print(f"[SMS-LOOKUP] ⚠  GHL contact lookup exception: {_lookup_err}")
         log.warning(f"[{contact_id}] GHL contact lookup exception: {_lookup_err}")
+        return ""
+
+
+async def fetch_ghl_opportunity_stage(contact_id: str) -> str:
+    """
+    Fetch the current GHL pipeline stage name for a contact.
+    Returns the stage name string (e.g. "Solar Savings Report Scheduled"),
+    or "" if no opportunity exists or the lookup fails.
+
+    This is the PRIMARY routing signal — called before every michael_agent() invocation.
+    """
+    if not contact_id:
+        return ""
+    url = f"{GHL_API_BASE}/opportunities/search"
+    headers = {
+        "Authorization": f"Bearer {GHL_API_KEY}",
+        "Content-Type" : "application/json",
+        "Version"      : "2021-07-28",
+    }
+    params = {
+        "location_id": GHL_LOCATION_ID,
+        "contact_id" : contact_id,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(url, headers=headers, params=params)
+        if r.is_success:
+            data          = r.json()
+            opportunities = data.get("opportunities") or []
+            if not opportunities:
+                print(f"[STAGE-LOOKUP] ℹ  No opportunities for contact={contact_id!r}", flush=True)
+                return ""
+            opp        = opportunities[0]
+            stage_name = (
+                (opp.get("pipelineStage") or {}).get("name") or
+                opp.get("stageName") or
+                opp.get("stage_name") or
+                ""
+            )
+            stage_name = stage_name.strip()
+            print(f"[STAGE-LOOKUP] 📊 GHL stage={stage_name!r} | contact={contact_id!r}", flush=True)
+            return stage_name
+        print(f"[STAGE-LOOKUP] ⚠  Opportunity lookup failed: status={r.status_code}", flush=True)
+        return ""
+    except Exception as _e:
+        print(f"[STAGE-LOOKUP] ⚠  Opportunity lookup exception: {_e}", flush=True)
         return ""
 
 
@@ -3712,6 +3916,10 @@ async def inbound_webhook(request: Request):
         print(f"[INBOUND] ║  all top-level keys: {_raw_keys}")
         print(f"[INBOUND] ║  has 'message' key : {bool(body.get('message') or body.get('body') or body.get('text'))}")
         print(f"[INBOUND] ║  has 'direction'   : {body.get('direction')!r}")
+        _has_media = bool(
+            body.get("attachments") or body.get("mediaUrls") or
+            body.get("media") or body.get("mediaUrl")
+        )
         print(f"[INBOUND] ║  has 'attachments' : {bool(body.get('attachments') or body.get('mediaUrls') or body.get('media'))}")
         print(f"[INBOUND] ║  message_type      : {str(body.get('messageType') or body.get('message_type') or '(not set)')!r}")
         print(f"[INBOUND] ║  source field      : {str(body.get('source') or body.get('lead_source') or '(not set)')!r}")
@@ -3746,6 +3954,14 @@ async def inbound_webhook(request: Request):
         print(f"[INBOUND] Direction  : {direction}")
         print(f"[INBOUND] Tags       : {tags}")
         print(f"[INBOUND] Address    : {address or '(not provided)'}")
+
+        # ── Fetch GHL pipeline stage — PRIMARY routing driver ─────
+        _ghl_stage: str = ""
+        _ghl_tags: list = list(tags) if tags else []
+        if contact_id:
+            _ghl_stage = await fetch_ghl_opportunity_stage(contact_id)
+            print(f"[PIPELINE] 📊 GHL pipeline stage={_ghl_stage!r} | contact={contact_id}", flush=True)
+
         print(f"[INBOUND] Lead source: {lead_source or '(not provided)'}")
         if custom_fields:
             print(f"[INBOUND] Custom fields: {custom_fields}")
@@ -5214,9 +5430,28 @@ async def inbound_webhook(request: Request):
         print(f"[REPLY]  routing via     : {'SMS_REPLY_PATH [FIX-8.A]' if _is_inbound_sms_reply and not _is_lead_payload else 'LEAD_PATH'}", flush=True)
         print(f"{'*'*64}\n", flush=True)
 
+        # ── Booked-stage bill photo handler ───────────────────────
+        # If contact is in a booked pipeline stage AND sent an image/attachment,
+        # interpret as a utility bill photo and send the canned ack immediately.
+        # Never run the qualification agent for this case.
+        if _ghl_stage in GHL_BOOKED_STAGES and _has_media:
+            _bill_ack    = "Perfect, got it. I'll take a look before I come by 👍"
+            _ack_phone   = get_state(contact_id).get("phone", "") or phone
+            print(
+                f"[PIPELINE] 📸 Booked media received (stage={_ghl_stage!r}) — sending bill ack | contact={contact_id}",
+                flush=True,
+            )
+            log.info(f"[{contact_id}] Booked bill photo ack | stage={_ghl_stage!r}")
+            if not is_duplicate_outbound(contact_id, _bill_ack):
+                try:
+                    await send_sms_via_ghl(contact_id, _bill_ack, to_number=_ack_phone)
+                except Exception as _ack_err:
+                    print(f"[PIPELINE] ❌ Bill ack send failed: {_ack_err}", flush=True)
+            return JSONResponse({"status": "success", "action": "bill_photo_ack", "stage": _ghl_stage})
+
         # ── Run the agent ─────────────────────────────────────────
-        print(f"[REPLY] ▶ Calling michael_agent() | stage={_pre_stage} | msg={inbound_text!r}", flush=True)
-        reply = michael_agent(contact_id, inbound_text)
+        print(f"[REPLY] ▶ Calling michael_agent() | stage={_pre_stage} | ghl_stage={_ghl_stage!r} | msg={inbound_text!r}", flush=True)
+        reply = michael_agent(contact_id, inbound_text, ghl_pipeline_stage=_ghl_stage, ghl_tags=_ghl_tags)
 
         # ── Post-agent state snapshot ─────────────────────────────
         _post_state    = get_state(contact_id)
