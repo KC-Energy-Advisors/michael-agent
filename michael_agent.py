@@ -4066,7 +4066,27 @@ async def inbound_webhook(request: Request):
         # redirects when the webhook contact_id has no/INITIAL state AND the
         # known contact_id has history.  So legitimate new contacts (no history)
         # are unaffected.
-        if phone:
+        #
+        # [FIX-12] EXCEPTION: never redirect a LIVE inbound human SMS.
+        # A live inbound text always carries the correct, current GHL contact_id
+        # (GHL just received the message on that contact).  Redirecting it via the
+        # in-memory phone map can point at a STALE contact_id from a prior session
+        # for the same number (common when re-testing from one phone), which:
+        #   1. drags in that old contact's booked state/tags → wrong booked
+        #      follow-up path instead of the live reply / qualification path, and
+        #   2. 400s with "Contact not found" at /conversations/messages when that
+        #      old contact was deleted or merged in GHL.
+        # The phone-map redirect is only needed for appointment / MMS webhooks
+        # that legitimately arrive with a different or missing contact_id — those
+        # have has_real_message=False, so this gate preserves them.
+        _is_live_text_reply = (direction == "inbound" and bool(parsed.get("has_real_message")))
+        if phone and _is_live_text_reply:
+            print(
+                f"[PHONE-MAP] ⏭ [FIX-12] live inbound SMS — keeping GHL-provided "
+                f"contact_id {contact_id!r} (phone-map redirect skipped)",
+                flush=True,
+            )
+        elif phone:
             _resolved_cid = _resolve_contact_id_by_phone(contact_id, phone)
             if _resolved_cid != contact_id:
                 print(
