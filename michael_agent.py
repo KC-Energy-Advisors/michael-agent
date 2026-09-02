@@ -495,6 +495,7 @@ import re
 import sys
 import json
 import hashlib
+import hmac
 import logging
 import traceback
 from enum import Enum
@@ -714,6 +715,11 @@ for _cred_name, _cred_val in (("GHL_API_KEY", GHL_API_KEY), ("GHL_LOCATION_ID", 
 MAX_DAILY_MSGS  = 6
 CENTRAL_TZ      = ZoneInfo("America/Chicago")
 BOOKED_TAG      = os.getenv("BOOKED_TAG", "appointment booked")
+
+# [DEBUG-RESET] Shared secret guarding POST /debug/reset-contact.
+# No default and no fallback: when unset the endpoint is hard-disabled (503),
+# so an un-configured deployment cannot expose it.  Never logged.
+DEBUG_RESET_SECRET = os.getenv("DEBUG_RESET_SECRET", "")
 
 
 # ─────────────────────────────────────────────
@@ -1584,6 +1590,32 @@ _processed_fingerprints: set[str] = set()
 _outbound_fingerprints:  set[str] = set()
 _MAX_DEDUP_CACHE = 2000
 
+# ── [DEBUG-RESET] Dedup-cache ownership index ────────────────────────
+# The dedup caches above store opaque SHA-1 hashes (and raw GHL event ids)
+# with no recoverable link back to the contact they belong to.  That makes a
+# *per-contact* cache purge impossible without a side index.
+#
+# This dict maps  cache_key -> contact_id  and is written next to every
+# .add() below.  It is READ BY EXACTLY ONE CALLER: the /debug/reset-contact
+# endpoint.  No dedup decision consults it, so inbound/outbound dedup
+# behaviour for real leads is completely unchanged.
+#
+# Staleness is harmless by construction: entries may outlive the cache values
+# they point at (the caches self-evict), and a reset then performs a
+# set.discard() on an already-absent key — a no-op.
+_dedup_owner: dict[str, str] = {}
+_MAX_DEDUP_OWNER = 16000
+
+
+def _remember_dedup_owner(key: str, contact_id: str) -> None:
+    """[DEBUG-RESET] Record which contact planted a dedup cache key."""
+    if not (key and contact_id):
+        return
+    if len(_dedup_owner) >= _MAX_DEDUP_OWNER:
+        for _k in list(_dedup_owner)[: _MAX_DEDUP_OWNER // 2]:
+            _dedup_owner.pop(_k, None)
+    _dedup_owner[key] = contact_id
+
 # Inbound dedup window: seconds.  Catches GHL's typical multi-webhook delivery
 # gap (0–3s) while allowing a user's second reply (usually 10s+ later) through.
 _INBOUND_DEDUP_WINDOW_SECS: int = 8
@@ -1675,6 +1707,8 @@ def is_duplicate_inbound(
         _evict_fingerprints_if_needed()
         _processed_fingerprints.add(t1_fp)
         _processed_fingerprints.add(t2_fp)
+        _remember_dedup_owner(t1_fp, contact_id)   # [DEBUG-RESET] index only
+        _remember_dedup_owner(t2_fp, contact_id)   # [DEBUG-RESET] index only
         return False, f"new_event | tier=1_ghl_id={ghl_message_id!r} | also_registered_tier2 | {t2_desc}"
     else:
         # No GHL message ID — TIER 2 only
@@ -1682,6 +1716,7 @@ def is_duplicate_inbound(
             return True, f"fingerprint_match | {t2_desc}"
         _evict_fingerprints_if_needed()
         _processed_fingerprints.add(t2_fp)
+        _remember_dedup_owner(t2_fp, contact_id)   # [DEBUG-RESET] index only
         return False, f"new_event | {t2_desc}"
 
 
@@ -1709,6 +1744,7 @@ def is_duplicate_outbound(contact_id: str, message: str) -> bool:
         _outbound_fingerprints.clear()
         _outbound_fingerprints.update(_keep)
     _outbound_fingerprints.add(fp)
+    _remember_dedup_owner(fp, contact_id)          # [DEBUG-RESET] index only
     return False
 
 
@@ -1737,9 +1773,13 @@ _processed_event_ids: set[str] = set()
 _MAX_EVENT_ID_CACHE = 5000
 
 
-def _is_duplicate_event_id(event_id: str) -> bool:
+def _is_duplicate_event_id(event_id: str, contact_id: str = "") -> bool:
     """
     [FIX-11] Returns True if this event_id was already processed.
+
+    contact_id is OPTIONAL and purely informational: when supplied it is
+    recorded in the [DEBUG-RESET] ownership index so /debug/reset-contact can
+    purge this contact's event ids.  It has no effect on the return value.
     LRU-evicts the oldest half when the cache is full.
     Returns False (non-duplicate) when event_id is empty — we cannot
     deduplicate what we cannot identify, so we let it through.
@@ -1756,6 +1796,7 @@ def _is_duplicate_event_id(event_id: str) -> bool:
         _processed_event_ids.update(pruned)
 
     _processed_event_ids.add(event_id)
+    _remember_dedup_owner(event_id, contact_id)    # [DEBUG-RESET] index only
     return False
 
 
@@ -4038,7 +4079,7 @@ async def inbound_webhook(request: Request):
         # This catches different-body duplicates for the SAME underlying event
         # by matching on GHL's own event/message ID.
         _event_id = parsed.get("event_id", "")
-        if _event_id and _is_duplicate_event_id(_event_id):
+        if _event_id and _is_duplicate_event_id(_event_id, contact_id):
             print(
                 f"\n[DEDUP] ⚡ [FIX-11] Event-ID duplicate detected — "
                 f"event_id={_event_id!r} already processed → SKIP"
@@ -5845,6 +5886,27 @@ async def booking_followup(request: Request):
 #  DEBUG ENDPOINTS
 # ─────────────────────────────────────────────
 
+def _debug_auth_error(request: Request) -> Optional[JSONResponse]:
+    """
+    [DEBUG-RESET] Shared guard for state-mutating debug endpoints.
+
+    Returns a JSONResponse to return immediately, or None when the caller
+    is authorised.  Behaviour:
+      • DEBUG_RESET_SECRET unset  -> 503, endpoint hard-disabled
+      • header missing / wrong    -> 401
+    Constant-time compare; the secret is never logged or echoed.
+    """
+    if not DEBUG_RESET_SECRET:
+        return JSONResponse(
+            {"error": "debug endpoint disabled: DEBUG_RESET_SECRET is not configured"},
+            status_code=503,
+        )
+    _supplied = request.headers.get("X-Debug-Secret", "")
+    if not (_supplied and hmac.compare_digest(_supplied, DEBUG_RESET_SECRET)):
+        log.warning("[DEBUG-AUTH] 401 - missing or invalid X-Debug-Secret")
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return None
+
 @app.get("/debug/state/{contact_id}")
 async def debug_get_state(contact_id: str):
     """
@@ -5859,16 +5921,254 @@ async def debug_get_state(contact_id: str):
 
 
 @app.post("/debug/reset/{contact_id}")
-async def debug_reset_state(contact_id: str):
+async def debug_reset_state(contact_id: str, request: Request):
     """
     Delete all state for a contact (reset to INITIAL).
     POST /debug/reset/{contact_id}
+    X-Debug-Secret: <DEBUG_RESET_SECRET>
+
+    NOTE: this clears _state_store ONLY.  It does not unpin the phone map,
+    so a contact reset here can still be resurrected by
+    _resolve_contact_id_by_phone().  Use POST /debug/reset-contact for a
+    reset that actually produces a fresh lead.
     """
+    _auth = _debug_auth_error(request)
+    if _auth is not None:
+        return _auth
+
     existed = contact_id in _state_store
     if existed:
         del _state_store[contact_id]
     log.info(f"[DEBUG] State reset for {contact_id} (existed={existed})")
     return JSONResponse({"reset": True, "contact_id": contact_id, "existed": existed})
+
+
+# ─────────────────────────────────────────────
+#  [DEBUG-RESET]  SCOPED SINGLE-CONTACT STATE RESET
+#
+#  Purpose
+#  ───────
+#  Lets a tester re-run a lead (e.g. a Facebook lead) against their OWN phone
+#  number and be treated as a brand-new contact, without restarting the service
+#  and without touching any other lead.
+#
+#  Why the pre-existing /debug/reset/{contact_id} is not enough
+#  ────────────────────────────────────────────────────────────
+#  That endpoint clears _state_store only.  _phone_to_contact is
+#  first-registration-wins, so the tester's phone stays pinned to the OLD
+#  contact_id; the next lead is then redirected back onto the old contact by
+#  _resolve_contact_id_by_phone() and the stale conversation reappears.
+#  A useful reset MUST unpin the phone as well.
+#
+#  Scope — every operation is keyed to ONE contact/phone
+#  ────────────────────────────────────────────────────
+#    cleared : _state_store[cid]                     (stage, messages, flags)
+#              _phone_to_contact[norm]               (only this phone / this cid)
+#              _processed_fingerprints               (only this cid's keys)
+#              _outbound_fingerprints                (only this cid's keys)
+#              _processed_event_ids                  (only this cid's keys)
+#              _contact_last_processed_ts[cid]       (debounce)
+#              _contact_processing_locks[cid]        (only if NOT held)
+#    untouched : the GHL contact, its tags, its opportunities, its appointments,
+#                every other contact, and all production routing.
+#
+#  Authoritative-truth safety
+#  ──────────────────────────
+#  A booked appointment lives in GHL, not here.  If this contact looks booked
+#  the endpoint REFUSES (409) unless force=true.  Even with force=true nothing
+#  in GHL is modified: because the booked tags survive, the very next inbound
+#  webhook re-restores appointment_booked via the existing tag-restore path.
+#  In-memory clearing therefore cannot destroy production truth — it can only
+#  make this process briefly forget it.
+# ─────────────────────────────────────────────
+
+def _mask_phone(phone: str) -> str:
+    """Mask a phone for logging: keep the last 4 digits only."""
+    digits = re.sub(r"\D", "", phone or "")
+    return f"***{digits[-4:]}" if len(digits) >= 4 else "***"
+
+
+async def _debug_fetch_ghl_booked(contact_id: str) -> tuple[Optional[bool], list[str]]:
+    """
+    [DEBUG-RESET] Read-only GHL lookup for the booked-state safety check.
+
+    Returns (is_booked, tags).  is_booked is None when GHL could not be
+    reached — the caller treats that as "unknown" and fails safe.
+    Performs a GET only; never writes to GHL.
+    """
+    if not (contact_id and GHL_API_KEY):
+        return None, []
+    url     = f"{GHL_API_BASE}/contacts/{contact_id}"
+    headers = {
+        "Authorization": f"Bearer {GHL_API_KEY}",
+        "Content-Type" : "application/json",
+        "Version"      : "2021-07-28",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(url, headers=headers)
+        if not r.is_success:
+            return None, []
+        data    = r.json()
+        contact = data.get("contact") or data
+        tags    = [str(t) for t in (contact.get("tags") or [])]
+        return is_already_booked(tags), tags
+    except Exception:
+        return None, []
+
+
+@app.post("/debug/reset-contact")
+async def debug_reset_contact(request: Request):
+    """
+    Clear this process's in-memory state for ONE contact/phone so it behaves
+    like a brand-new lead.  Nothing in GHL is modified.
+
+        POST /debug/reset-contact
+        X-Debug-Secret: <DEBUG_RESET_SECRET>
+        {"contact_id": "...", "phone": "...", "force": false}
+
+    At least one of contact_id / phone is required; supplying both is best
+    (phone alone resolves the contact_id through the phone map).
+    """
+    # ── AUTH ─────────────────────────────────────────────────────────
+    # Hard-disabled when the secret is not configured, so an un-configured
+    # deploy can never expose this.  Constant-time compare.  Never logged.
+    _auth = _debug_auth_error(request)
+    if _auth is not None:
+        return _auth
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+
+    contact_id = str(body.get("contact_id", "") or "").strip()
+    phone      = str(body.get("phone", "") or "").strip()
+    force      = bool(body.get("force", False))
+    norm       = _normalize_phone(phone)
+
+    if not (contact_id or norm):
+        return JSONResponse(
+            {"error": "at least one of contact_id or phone is required"},
+            status_code=400,
+        )
+
+    # Resolve contact_id from the phone map when only a phone was supplied.
+    if not contact_id and norm:
+        contact_id = _phone_to_contact.get(norm, "")
+
+    # ── SAFETY CHECK: do not silently erase a real booking ───────────
+    _mem_state  = _state_store.get(contact_id) if contact_id else None
+    _mem_booked = bool(
+        _mem_state and (
+            _mem_state.get("appointment_booked")
+            or _mem_state.get("stage") in (Stage.BOOKED,)
+        )
+    )
+    _ghl_booked, _ghl_tags = await _debug_fetch_ghl_booked(contact_id)
+
+    # Fail safe: an unreachable GHL ("unknown", None) counts as possibly booked.
+    _looks_booked = _mem_booked or (_ghl_booked is not False)
+
+    if _looks_booked and not force:
+        log.info(
+            f"[DEBUG-RESET] 409 refused | contact_id={contact_id!r} | "
+            f"phone={_mask_phone(phone)} | mem_booked={_mem_booked} | "
+            f"ghl_booked={_ghl_booked} (None=lookup unavailable)"
+        )
+        return JSONResponse(
+            {
+                "reset"        : False,
+                "warning"      : "contact appears BOOKED, or booked-state could not be verified",
+                "contact_id"   : contact_id,
+                "phone"        : _mask_phone(phone),
+                "memory_booked": _mem_booked,
+                "ghl_booked"   : _ghl_booked,
+                "note": (
+                    "No state was changed. Re-send with force=true to clear "
+                    "ephemeral in-memory state only. GHL tags, opportunities and "
+                    "appointments are never modified by this endpoint, so the "
+                    "authoritative booked state survives and is re-restored from "
+                    "tags on the next inbound webhook."
+                ),
+            },
+            status_code=409,
+        )
+
+    # ── SCOPED CLEAR ─────────────────────────────────────────────────
+    cleared: dict[str, int] = {}
+
+    if contact_id and _state_store.pop(contact_id, None) is not None:
+        cleared["_state_store"] = 1
+
+    # Unpin the phone: drop the entry for this phone AND any entry pointing at
+    # this contact_id.  Both are exact-key removals — no other lead is touched.
+    _phone_keys = set()
+    if norm and norm in _phone_to_contact:
+        _phone_keys.add(norm)
+    if contact_id:
+        _phone_keys |= {k for k, v in _phone_to_contact.items() if v == contact_id}
+    for _k in _phone_keys:
+        _phone_to_contact.pop(_k, None)
+    if _phone_keys:
+        cleared["_phone_to_contact"] = len(_phone_keys)
+
+    # Dedup caches: remove only the keys this contact planted, via the index.
+    if contact_id:
+        _owned = [k for k, v in _dedup_owner.items() if v == contact_id]
+        _n_in = _n_out = _n_evt = 0
+        for _k in _owned:
+            if _k in _processed_fingerprints:
+                _processed_fingerprints.discard(_k)
+                _n_in += 1
+            if _k in _outbound_fingerprints:
+                _outbound_fingerprints.discard(_k)
+                _n_out += 1
+            if _k in _processed_event_ids:
+                _processed_event_ids.discard(_k)
+                _n_evt += 1
+            _dedup_owner.pop(_k, None)
+        if _n_in:
+            cleared["_processed_fingerprints"] = _n_in
+        if _n_out:
+            cleared["_outbound_fingerprints"] = _n_out
+        if _n_evt:
+            cleared["_processed_event_ids"] = _n_evt
+
+    if contact_id and _contact_last_processed_ts.pop(contact_id, None) is not None:
+        cleared["_contact_last_processed_ts"] = 1
+
+    # Only drop a lock that is NOT currently held — removing a held lock would
+    # let a concurrent in-flight webhook for this contact lose mutual exclusion.
+    # A held lock is released by its own finally block anyway.
+    _lock = _contact_processing_locks.get(contact_id) if contact_id else None
+    if _lock is not None and not _lock.locked():
+        _contact_processing_locks.pop(contact_id, None)
+        cleared["_contact_processing_locks"] = 1
+    elif _lock is not None:
+        cleared["_contact_processing_locks_skipped_locked"] = 1
+
+    log.info(
+        f"[DEBUG-RESET] ✅ reset ok | contact_id={contact_id!r} | "
+        f"phone={_mask_phone(phone)} | force={force} | cleared={cleared}"
+    )
+    print(
+        f"[DEBUG-RESET] ✅ contact={contact_id!r} phone={_mask_phone(phone)} "
+        f"force={force} cleared={cleared}"
+    )
+
+    return JSONResponse({
+        "reset"      : True,
+        "contact_id" : contact_id,
+        "phone"      : _mask_phone(phone),
+        "forced"     : force,
+        "cleared"    : cleared,
+        "ghl_booked" : _ghl_booked,
+        "note": (
+            "In-memory state only. GHL contact, tags, opportunities and "
+            "appointments were not modified."
+        ),
+    })
 
 
 @app.post("/debug/send-test-sms")
