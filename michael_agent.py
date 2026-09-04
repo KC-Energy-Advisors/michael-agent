@@ -713,6 +713,24 @@ for _cred_name, _cred_val in (("GHL_API_KEY", GHL_API_KEY), ("GHL_LOCATION_ID", 
         log.warning(f"⚠️  STARTUP WARNING: {_cred_name} is not set — all GHL API calls will fail until this is configured in .env")
         model = MODEL
 MAX_DAILY_MSGS  = 6
+
+# ── [META-B1] Durable GHL tag markers ────────────────────────────────────
+# These are the ONLY tags Michael relies on for cross-restart durability.
+# Process memory (_state_store) is wiped on every Render restart/spin-down,
+# so anything that must survive a restart lives in GHL as a contact tag.
+#   TAG_ENGAGED  — lead has replied at least once.  Gates the GHL nurture
+#                  workflow (no canned follow-up once a human is talking)
+#                  AND suppresses a repeat first-outreach after a restart.
+#   TAG_DNC      — durable opt-out marker.  Matches the existing GHL
+#                  "solar-dnc" tag used by the Customer Replied trigger
+#                  filter, so the two systems agree on one marker.
+TAG_ENGAGED = "ai-engaged"
+TAG_DNC     = "solar-dnc"
+TAG_OUTREACH_SENT = "ai-outreach-sent"
+#   TAG_DISQUALIFIED — durable "stop nurturing this lead" marker, lowercase
+#                  to match the solar-dnc convention the GHL workflows gate on.
+TAG_DISQUALIFIED  = "solar-disqualified"
+
 CENTRAL_TZ      = ZoneInfo("America/Chicago")
 BOOKED_TAG      = os.getenv("BOOKED_TAG", "appointment booked")
 
@@ -2283,7 +2301,7 @@ def build_system_prompt(state: dict, ghl_pipeline_stage: str = "", ghl_tags: lis
     elif stage == Stage.DNC:
         current_goal = "DNC — contact opted out. Do not respond."
     elif stage == Stage.ASK_BILL or (homeown == "yes" and loc_conf and not bill):
-        current_goal = "ASK BILL — ask for their average monthly electric bill (ballpark is fine). $100+/month: clearly qualified. $75–99: borderline, worth reviewing. Under $75: likely not a fit — say so honestly."
+        current_goal = "ASK BILL — ask what the Ameren bill usually runs, conversationally and open-ended (e.g. 'About what does the Ameren bill usually run you? Even a rough guess is fine.'). Do NOT offer bracket choices. Accept any natural phrasing ('around 170', '150ish', 'couple hundred') and move on. $100+/month: clearly qualified. $75–99: borderline, worth reviewing. Under $75: likely not a fit — say so honestly."
     elif loc_conf and homeown != "yes":
         # Area confirmed — move to ownership question next
         current_goal = "ASK OWNERSHIP — find out if they own the home."
@@ -2358,7 +2376,9 @@ QUALIFICATION ORDER — skip any step already confirmed above:
    → Renter: "Got it — solar really only works for homeowners. If that ever changes, reach out." [DISQUALIFY:NOT_OWNER]
 
 3. AVERAGE MONTHLY AMEREN BILL?
-   Ask: "Roughly what's your average monthly Ameren bill — under $100, $100–150, $150–200, or $200+?"
+   Ask: "About what does the Ameren bill usually run you? Even a rough guess is fine."
+   Accept ANY natural phrasing — "around 170", "like 200 in summer", "150ish", "couple hundred".
+   Never present bracket choices and never re-ask for a more exact figure once you have a ballpark.
    → $100+/month: QUALIFIED → go to BOOKING immediately
    → Under $100: "At that rate, the math is harder to make work. I'll keep your info on file in case it changes." [DISQUALIFY:LOW_BILL]
 
@@ -2530,6 +2550,56 @@ def is_booking_confirmation(text: str) -> bool: return bool(BOOKED_KEYWORDS.sear
 # ─────────────────────────────────────────────
 #  BOOKED-CONTACT MESSAGES
 # ─────────────────────────────────────────────
+
+# ─────────────────────────────────────────────
+#  [META-B1] STRUCTURED EVENT LOG
+#
+#  One line per funnel-relevant decision, greppable in Render logs.
+#  Carries contact_id and a masked phone only — never a name, never a
+#  message body, never a token.
+# ─────────────────────────────────────────────
+
+def ev(event: str, contact_id: str = "", **fields) -> None:
+    """Emit one structured funnel event to stdout AND the logger."""
+    parts = [f"contact={contact_id or '(none)'}"]
+    for k, v in fields.items():
+        if k in ("phone", "to_number"):
+            v = _mask_phone(str(v))
+        parts.append(f"{k}={v}")
+    line = f"[EVENT] {event} | " + " | ".join(parts)
+    print(line, flush=True)
+    log.info(line)
+
+
+# ── [META-B1] Meta / paid-social lead detection ──────────────────────────
+# A Meta Instant Form lead reaches us either with a source string from the
+# GHL Facebook integration or with the meta-lead tag applied by the
+# "Facebook/IG Paid Lead" workflow.  Either signal is sufficient.
+_META_SOURCE_TOKENS = (
+    "facebook", "faceb", "instagram", "insta", "meta",
+    "fb_lead", "fb-lead", "fblead", "ig_lead", "ig-lead",
+    "paid_social", "paid-social",
+)
+_META_TAGS = frozenset({"meta-lead", "facebook-lead", "fb-lead", "ig-lead", "paid-social"})
+
+
+def is_meta_lead(lead_source: str = "", tags: list | None = None) -> bool:
+    """True when this contact came from a Meta (Facebook/Instagram) paid form."""
+    src = (lead_source or "").lower().strip()
+    if src and any(tok in src for tok in _META_SOURCE_TOKENS):
+        return True
+    for t in (tags or []):
+        tl = str(t).lower().strip()
+        if tl in _META_TAGS or tl == "facebook":
+            return True
+    return False
+
+
+def has_tag(tags: list | None, wanted: str) -> bool:
+    """Case-insensitive membership test against a GHL tags list."""
+    w = wanted.lower().strip()
+    return any(str(t).lower().strip() == w for t in (tags or []))
+
 
 _INVALID_NAMES = {"unknown", "none", "", "admin", "admin notifications", "notifications"}
 
@@ -2955,9 +3025,11 @@ Current GHL pipeline stage: {ghl_pipeline_stage or "Solar Savings Report Schedul
 # ─────────────────────────────────────────────
 
 def build_new_contact_outreach(
-    first_name: str = "",
-    full_name:  str = "",
-    address:    str = "",
+    first_name:  str = "",
+    full_name:   str = "",
+    address:     str = "",
+    lead_source: str = "",
+    tags:        list | None = None,
 ) -> str:
     """
     First proactive SMS sent to a new chat-widget / form lead.
@@ -2980,9 +3052,24 @@ def build_new_contact_outreach(
       "Hey, this is Michael with STL Energy Advisors. Got your info — your home may be worth taking a look at.
        Quick question: are you on Ameren Missouri for electric?"
     """
-    first    = _resolve_first_name(first_name, full_name)
-    greeting = f"Hey {first}," if first else "Hey,"
+    first = _resolve_first_name(first_name, full_name)
 
+    # ── [META-B1] Meta/paid-social variant ───────────────────────────
+    # A Meta Instant Form is two taps on prefilled fields, so recall is
+    # low.  Naming the Facebook request turns the text from cold outreach
+    # into a continuation of something they just did.  Every other source
+    # keeps the original copy byte-for-byte.
+    if is_meta_lead(lead_source, tags):
+        greeting = f"Hey {first}," if first else "Hey,"
+        return (
+            f"{greeting} Michael here with STL Energy Advisors. "
+            f"I just got the request you submitted on Facebook to see if "
+            f"your home qualifies.\n"
+            f"I can check that for you real quick — are you currently with "
+            f"Ameren Missouri for electric?"
+        )
+
+    greeting = f"Hey {first}," if first else "Hey,"
     return (
         f"{greeting} this is Michael with STL Energy Advisors. "
         f"Got your info — your home may be worth taking a look at.\n"
@@ -3769,12 +3856,72 @@ async def update_ghl_contact(contact_id: str, tags: list[str]):
         log.info(f"[{contact_id}] GHL contact updated: tags={tags}")
 
 
+# ─────────────────────────────────────────────
+#  [META-B1] ADDITIVE TAG WRITER  — SAFETY CRITICAL
+#
+#  update_ghl_contact() above issues PUT /contacts/{id} with {"tags": [...]}.
+#  On the GHL contacts API that payload REPLACES the tag array, so writing
+#  ["QUALIFIED"] can drop "appointment booked", "solar-dnc", "meta-lead" and
+#  every other marker on the contact.  Those tags are exactly what this
+#  system now relies on for cross-restart durability, so a blind PUT would
+#  destroy the thing it is meant to protect.
+#
+#  add_ghl_tags() therefore reads the contact first, unions the requested
+#  tags with what is already there (case-insensitively), and writes back
+#  the merged set.  It skips the write entirely when nothing would change,
+#  so the common path costs one GET and no mutation.
+#
+#  Never call update_ghl_contact() directly for incremental tagging.
+# ─────────────────────────────────────────────
+
+async def add_ghl_tags(contact_id: str, new_tags: list[str]) -> bool:
+    """Add tags to a GHL contact WITHOUT dropping existing ones. Non-fatal."""
+    if not (contact_id and new_tags and GHL_API_KEY):
+        return False
+    url     = f"{GHL_API_BASE}/contacts/{contact_id}"
+    headers = {
+        "Authorization": f"Bearer {GHL_API_KEY}",
+        "Content-Type" : "application/json",
+        "Version"      : "2021-07-28",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(url, headers=headers)
+            if not r.is_success:
+                log.warning(f"[{contact_id}] add_ghl_tags: contact GET failed ({r.status_code})")
+                return False
+            data     = r.json()
+            contact  = data.get("contact") or data
+            existing = [str(t) for t in (contact.get("tags") or [])]
+
+            have   = {t.lower().strip() for t in existing}
+            to_add = [t for t in new_tags if t.lower().strip() not in have]
+            if not to_add:
+                return True   # already present — no write needed
+
+            merged = existing + to_add
+            w = await client.put(url, json={"tags": merged}, headers=headers)
+            if not w.is_success:
+                log.warning(f"[{contact_id}] add_ghl_tags: PUT failed ({w.status_code})")
+                return False
+        log.info(f"[{contact_id}] tags added: {to_add} (preserved {len(existing)} existing)")
+        return True
+    except Exception as err:
+        log.warning(f"[{contact_id}] add_ghl_tags failed (non-fatal): {err}")
+        return False
+
+
 def resolve_ghl_tags(stage: Stage) -> list[str]:
     tag_map = {
         Stage.SEND_BOOKING : ["QUALIFIED", "BOOKING_LINK_SENT"],
         Stage.BOOKED       : ["APPOINTMENT_BOOKED"],
-        Stage.DISQUALIFIED : ["NOT_QUALIFIED"],
-        Stage.DNC          : ["DNC"],
+        # [META-B1] TAG_DISQUALIFIED is the lowercase marker the GHL nurture
+        # workflow gates on, alongside the existing NOT_QUALIFIED tag.
+        Stage.DISQUALIFIED : ["NOT_QUALIFIED", TAG_DISQUALIFIED],
+        # [META-B1] TAG_DNC is the durable marker the GHL Customer Replied
+        # trigger filter ("Doesn't have tag solar-dnc") reads.  Writing it
+        # here is what makes an opt-out survive a Render restart.
+        Stage.DNC          : ["DNC", TAG_DNC],
     }
     return tag_map.get(stage, [])
 
@@ -4168,6 +4315,7 @@ async def inbound_webhook(request: Request):
                 f"{'duplicate — skipping' if _ud_is_dup else 'new event — proceeding'} | {_ud_reason}"
             )
             if _ud_is_dup:
+                ev("DUPLICATE_INBOUND_DROPPED", contact_id, layer="content_fingerprint")
                 return JSONResponse({
                     "status"      : "success",
                     "skipped"     : True,
@@ -4223,6 +4371,48 @@ async def inbound_webhook(request: Request):
         await _proc_lock.acquire()
         _lock_acq = True
         print(f"[LOCK] 🔒 {contact_id} lock acquired — processing serialized", flush=True)
+
+        # ══════════════════════════════════════════════════════════════
+        #  [META-B1] DURABLE DNC RESTORE  — runs before ALL routing
+        #
+        #  Stage.DNC lives in _state_store, which is wiped on every Render
+        #  restart and spin-down.  An opted-out lead who texts again after a
+        #  restart would otherwise be processed as brand new, and
+        #  is_stop_request() only matches if THAT message repeats a STOP
+        #  keyword — so a plain "hey" would get a reply.
+        #
+        #  The solar-dnc GHL tag is the durable record.  Restoring from it
+        #  here makes opt-out survive anything that kills the process.
+        # ══════════════════════════════════════════════════════════════
+        if has_tag(tags, TAG_DNC):
+            _dnc_state = get_state(contact_id)
+            if _dnc_state.get("stage") != Stage.DNC:
+                _dnc_state["stage"] = Stage.DNC
+                save_state(contact_id, _dnc_state)
+                ev("DNC_RESTORED_FROM_TAG", contact_id, tag=TAG_DNC)
+
+        # ══════════════════════════════════════════════════════════════
+        #  [META-B1] ENGAGEMENT MARKER  — cancels pending GHL nurture
+        #
+        #  Written on ANY real inbound message, including STOP.  The GHL
+        #  nurture workflow re-checks this tag immediately before each
+        #  follow-up send, so writing it here is what guarantees a canned
+        #  message never lands on top of a live conversation.
+        #  Additive and non-fatal — a tag failure must never cost a reply.
+        # ══════════════════════════════════════════════════════════════
+        if direction == "inbound" and parsed.get("has_real_message"):
+            ev(
+                "INBOUND_RECEIVED", contact_id,
+                phone=phone,
+                stage=str(get_state(contact_id).get("stage")),
+                meta=is_meta_lead(lead_source, tags),
+            )
+            if not has_tag(tags, TAG_ENGAGED):
+                try:
+                    if await add_ghl_tags(contact_id, [TAG_ENGAGED]):
+                        ev("NURTURE_CANCELLED_REPLY_RECEIVED", contact_id, tag=TAG_ENGAGED)
+                except Exception as _eng_err:
+                    log.warning(f"[{contact_id}] engagement tag write failed (non-fatal): {_eng_err}")
 
         # ══════════════════════════════════════════════════════════════
         #  PRIORITY ROUTING GUARDS  [FIX-7 / FIX-9]
@@ -5206,6 +5396,8 @@ async def inbound_webhook(request: Request):
             msg_type = "lead"
             print(f"[DEBUG] msg_type resolved as: {msg_type}")
             state = get_state(contact_id)
+            if is_meta_lead(lead_source, tags):
+                ev("META_LEAD_RECEIVED", contact_id, phone=phone, source=lead_source or "(none)")
 
             # Enrich state before stage check
             if not state.get("contact_name") and full_name != "Unknown":
@@ -5215,6 +5407,29 @@ async def inbound_webhook(request: Request):
             if not state.get("address") and address:
                 state["address"] = address      # [ADAPT-4] save address for system prompt
             save_state(contact_id, state)
+
+            # ── [META-B1] First-outreach suppression ──────────────────
+            # ai-outreach-sent / ai-engaged are durable GHL tags, so this
+            # holds across restarts where _state_store does not.
+            if state["stage"] == Stage.INITIAL and (
+                has_tag(tags, TAG_ENGAGED) or has_tag(tags, TAG_OUTREACH_SENT)
+            ):
+                state["stage"]              = Stage.ASK_OWNERSHIP
+                state["location_confirmed"] = True
+                if not state.get("entry_path") or state["entry_path"] == "unknown":
+                    state["entry_path"] = "chat_widget"
+                save_state(contact_id, state)
+                ev(
+                    "FIRST_OUTREACH_SUPPRESSED", contact_id,
+                    reason="already_outreached_or_engaged",
+                    path="form_submission",
+                )
+                return JSONResponse({
+                    "status"      : "success",
+                    "skipped"     : True,
+                    "reason"      : "first_outreach_already_sent",
+                    "contact_id"  : contact_id,
+                })
 
             if state["stage"] == Stage.INITIAL:
                 # ── [PATH-1] Stamp entry_path as chat_widget ──────────────
@@ -5236,6 +5451,8 @@ async def inbound_webhook(request: Request):
                     first_name=first_name,
                     full_name=full_name,
                     address=address,
+                    lead_source=lead_source,
+                    tags=tags,
                 )
                 print(f"[ROUTING] First-outreach: {outreach!r}")
 
@@ -5264,6 +5481,18 @@ async def inbound_webhook(request: Request):
                     return JSONResponse({"status": "success", "note": "first-outreach SMS failed"})
 
                 print(f"[SMS] ✅ First-outreach sent to {full_name!r}")
+                # [META-B1] Durable marker — makes the suppression above work
+                # across restarts and duplicate Meta submissions.
+                try:
+                    await add_ghl_tags(contact_id, [TAG_OUTREACH_SENT])
+                except Exception as _ot_err:
+                    log.warning(f"[{contact_id}] outreach tag write failed (non-fatal): {_ot_err}")
+                ev(
+                    "FIRST_OUTREACH_SENT", contact_id,
+                    phone=phone,
+                    meta=is_meta_lead(lead_source, tags),
+                    path="form_submission",
+                )
                 return JSONResponse({"status": "success", "replied": True, "reply": outreach, "payload_type": "form_submission_new_contact"})
 
             elif state["stage"] == Stage.SEND_BOOKING:
@@ -5399,6 +5628,24 @@ async def inbound_webhook(request: Request):
         #   • Never close the conversation on the first message
         #   • Always continue with the qualification conversation
         #   • PATH: NEW_LEAD_PATH (logged explicitly)
+        # ── [META-B1] First-outreach suppression (real-message path) ──
+        # Restart recovery: outreach already went out, so re-sending the
+        # intro would repeat a question the lead has already seen.
+        # Advance the stage and fall through to normal Claude handling.
+        if state["stage"] == Stage.INITIAL and (
+            has_tag(tags, TAG_ENGAGED) or has_tag(tags, TAG_OUTREACH_SENT)
+        ):
+            state["stage"]              = Stage.ASK_OWNERSHIP
+            state["location_confirmed"] = True
+            if not state.get("entry_path") or state["entry_path"] == "unknown":
+                state["entry_path"] = "chat_widget"
+            save_state(contact_id, state)
+            ev(
+                "FIRST_OUTREACH_SUPPRESSED", contact_id,
+                reason="already_outreached_or_engaged",
+                path="real_message",
+            )
+
         if state["stage"] == Stage.INITIAL:
             print(f"\n{'─'*60}")
             print(f"[ROUTING] 🆕 NEW_LEAD_PATH — INITIAL stage, real inbound chat widget message")
@@ -5418,6 +5665,8 @@ async def inbound_webhook(request: Request):
                 first_name=first_name,
                 full_name=full_name,
                 address=address,
+                lead_source=lead_source,
+                tags=tags,
             )
             print(f"[ROUTING] First-outreach (chat_widget real msg): {outreach!r}")
 
@@ -5616,8 +5865,12 @@ async def inbound_webhook(request: Request):
         # ── Update GHL tags (non-fatal) ───────────────────────────
         if ghl_tags:
             try:
-                print(f"[ROUTING] Updating GHL tags: {ghl_tags}")
-                await update_ghl_contact(contact_id, ghl_tags)
+                print(f"[ROUTING] Adding GHL tags: {ghl_tags}")
+                # [META-B1] add_ghl_tags (not update_ghl_contact) — preserves
+                # existing markers instead of replacing the whole tag array.
+                await add_ghl_tags(contact_id, ghl_tags)
+                if Stage.DNC in (state.get("stage"),):
+                    ev("DNC_SET", contact_id, source="stage_tag_write")
             except Exception as tag_err:
                 log.warning(f"[{contact_id}] GHL tag update failed (non-fatal): {tag_err}")
 
@@ -5651,6 +5904,8 @@ async def inbound_webhook(request: Request):
                     first_name=first_name,
                     full_name=full_name,
                     address=address,
+                    lead_source=lead_source,
+                    tags=tags,
                 )
                 _fb_state["stage"]              = Stage.ASK_OWNERSHIP
                 _fb_state["location_confirmed"] = True
