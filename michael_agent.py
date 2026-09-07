@@ -500,7 +500,7 @@ import logging
 import traceback
 from enum import Enum
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import Optional
 import asyncio
@@ -730,6 +730,44 @@ TAG_OUTREACH_SENT = "ai-outreach-sent"
 #   TAG_DISQUALIFIED — durable "stop nurturing this lead" marker, lowercase
 #                  to match the solar-dnc convention the GHL workflows gate on.
 TAG_DISQUALIFIED  = "solar-disqualified"
+#   TAG_UNDELIVERABLE — a message to this contact was filtered or rejected by
+#                  the carrier. Flags the contact for a human to look at.
+#                  It does NOT suppress sending: the invariant is about
+#                  booked contacts, not undeliverable ones.
+TAG_UNDELIVERABLE = "sms-undeliverable"
+
+# ── [DELIVERY-2] Carrier error taxonomy ──────────────────────────────────
+# Codes GHL surfaces through its "Messaging Error Code - SMS" workflow
+# trigger. PERMANENT means resending the same message to the same number
+# will fail again — retrying is pointless and, for filtered content,
+# actively harmful to sender reputation. Nothing in this file ever retries.
+_CARRIER_PERMANENT: frozenset = frozenset({
+    "30007",   # Message filtered (content / spam signals / carrier rules)
+    "30003",   # Unreachable destination handset
+    "30004",   # Message blocked
+    "30005",   # Unknown destination handset
+    "30006",   # Landline or unreachable carrier
+    "21211",   # Invalid "To" number
+    "21610",   # Recipient has opted out (STOP)
+    "21614",   # Not a mobile number
+    "30034",   # Unregistered / mis-registered A2P 10DLC sender
+})
+_CARRIER_TRANSIENT: frozenset = frozenset({
+    "30001",   # Queue overflow
+    "30002",   # Account suspended
+    "30008",   # Unknown error — may succeed on a later, different message
+    "21408",   # Permission to send to this region not enabled
+})
+
+
+def classify_carrier_error(code: str) -> str:
+    """"permanent" | "transient" | "unknown" for a carrier error code."""
+    c = str(code or "").strip()
+    if c in _CARRIER_PERMANENT:
+        return "permanent"
+    if c in _CARRIER_TRANSIENT:
+        return "transient"
+    return "unknown"
 
 CENTRAL_TZ      = ZoneInfo("America/Chicago")
 BOOKED_TAG      = os.getenv("BOOKED_TAG", "appointment booked")
@@ -743,6 +781,66 @@ DEBUG_RESET_SECRET = os.getenv("DEBUG_RESET_SECRET", "")
 # ─────────────────────────────────────────────
 #  QUALIFICATION STAGES
 # ─────────────────────────────────────────────
+
+class SendStatus(str, Enum):
+    """
+    [DELIVERY] Lifecycle of one outbound SMS.
+
+        not_attempted -> suppressed                    (guard/dedup: never sent)
+        not_attempted -> rejected                      (GHL refused at API time)
+        not_attempted -> accepted -> delivered|failed  (GHL queued it)
+
+    ACCEPTED is the crucial one. A 2xx from GHL means GHL took the message
+    for sending — NOT that a handset received it. Carrier failures such as
+    30007 arrive later, asynchronously, long after the 2xx.
+
+    DELIVERED and FAILED are only reachable from a delivery-status feed,
+    which does not exist yet. Nothing may claim DELIVERED until it does.
+    """
+    NOT_ATTEMPTED = "not_attempted"
+    SUPPRESSED    = "suppressed"
+    REJECTED      = "rejected"
+    ACCEPTED      = "accepted"
+    DELIVERED     = "delivered"
+    FAILED        = "failed"
+
+
+# Statuses that justify advancing conversation state. ACCEPTED qualifies:
+# the message is genuinely in flight and will usually arrive, and rolling it
+# back would risk asking the same question twice if it does.
+_STATUS_ADVANCES_STATE: frozenset = frozenset({
+    SendStatus.ACCEPTED, SendStatus.DELIVERED,
+})
+
+
+class SendKind(str, Enum):
+    """
+    [BOOKED-GUARD] Classification of every outbound SMS.
+
+    The booked guard suppresses only the classes that constitute unsolicited
+    progression of a lead. Replies to a booked contact, booking confirmations,
+    bill acknowledgments and opt-out confirmations are NEVER suppressed —
+    a booked homeowner must still be able to hold a conversation, and a STOP
+    confirmation is a compliance obligation.
+    """
+    OUTREACH      = "outreach"        # first contact                 GUARDED
+    QUALIFICATION = "qualification"   # AI qualifying question        GUARDED
+    BOOKING_PITCH = "booking_pitch"   # booking link / invite         GUARDED
+    NURTURE       = "nurture"         # no-response follow-up         GUARDED
+    BOOKED_REPLY  = "booked_reply"    # answering a booked contact
+    BILL_ACK      = "bill_ack"        # bill-photo acknowledgment
+    OPT_OUT       = "opt_out"         # STOP confirmation (compliance)
+    SYSTEM        = "system"          # failsafe / admin debug
+
+
+# Classes subject to the authoritative booked check.
+_BOOKED_GUARDED: frozenset = frozenset({
+    SendKind.OUTREACH,
+    SendKind.QUALIFICATION,
+    SendKind.BOOKING_PITCH,
+    SendKind.NURTURE,
+})
+
 
 class Stage(str, Enum):
     INITIAL       = "INITIAL"
@@ -854,6 +952,14 @@ def get_state(contact_id: str) -> dict:
             # Values: "utility" | "ownership" | "bill" | "send_booking" | "none"
             "pending_question"        : "none",
             "last_outbound_intent"    : "none",
+            # ── [DELIVERY] Outbound delivery bookkeeping ──────────────────
+            # last_send_status  — SendStatus of the most recent attempt.
+            # last_message_id   — GHL message id, for correlating a future
+            #                     delivery-status event back to this step.
+            # undelivered_count — permanent carrier failures seen so far.
+            "last_send_status"        : SendStatus.NOT_ATTEMPTED.value,
+            "last_message_id"         : "",
+            "undelivered_count"       : 0,
         }
     return _state_store[contact_id]
 
@@ -3762,7 +3868,300 @@ async def fetch_ghl_opportunity_stage(contact_id: str) -> str:
         return ""
 
 
-async def send_sms_via_ghl(contact_id: str, message: str, to_number: str = "") -> dict:
+# ═════════════════════════════════════════════════════════════════════════
+#  [BOOKED-GUARD] AUTHORITATIVE BOOKED-STATE CHECK
+#
+#  THE INVARIANT
+#    Once a contact has a booked appointment, no outreach, qualification,
+#    nurture or booking-pitch SMS may ever leave this service for them.
+#
+#  WHY THIS EXISTS
+#    A contact booked at 07:11 received a fresh-lead qualification SMS at
+#    08:31. Routing had judged "booked" from THREE untrustworthy sources:
+#      • webhook payload tags   — absent from the payload entirely
+#      • process memory         — wiped by any restart
+#      • [FIX-4.A]              — actively discarded booked evidence for
+#                                 form-shaped payloads
+#    All three are controlled by the caller or by chance. None is authoritative.
+#
+#  THE RULE
+#    Immediately before every guarded send, ask GHL directly. A guarded SMS
+#    may leave ONLY on an affirmative "confirmed not booked". Booked, or any
+#    inability to determine the answer, suppresses the send.
+#
+#  THREE INDEPENDENT SOURCES — a positive from any one is decisive
+#    1. Contact tags        GET /contacts/{id}
+#    2. Opportunity stage   GET /opportunities/search   (GHL_BOOKED_STAGES)
+#    3. Appointments        GET /contacts/{id}/appointments
+#
+#    Source 3 is not redundant. The Vercel booking route creates the
+#    appointment via POST /calendars/events/appointments and applies NO tag;
+#    the tag arrives later from a GHL workflow. Between those two moments a
+#    real appointment exists while sources 1 and 2 are both still clean.
+#
+#  NO CACHING. Every guarded send performs a fresh lookup. A cache would
+#  reintroduce exactly the staleness this guard exists to eliminate.
+# ═════════════════════════════════════════════════════════════════════════
+
+_GHL_HEADERS_V2 = {"Version": "2021-07-28"}
+_GHL_HEADERS_V1 = {"Version": "2021-04-15"}
+
+
+def _ghl_headers(version: dict) -> dict:
+    return {
+        "Authorization": f"Bearer {GHL_API_KEY}",
+        "Content-Type" : "application/json",
+        **version,
+    }
+
+
+# Appointment statuses that mean the appointment is NOT active.
+# Anything not listed here, with a future start time, counts as booked —
+# an unrecognised status must never be read as "free to text them".
+_APPT_DEAD_STATUSES: frozenset = frozenset({
+    "cancelled", "canceled", "invalid", "deleted", "removed",
+    "noshow", "no-show", "no_show",
+})
+
+# Keys GHL may use for the appointment list / status / start time.
+_APPT_LIST_KEYS  = ("appointments", "events", "data", "items")
+_APPT_STATUS_KEYS = ("appointmentStatus", "status", "appointment_status")
+_APPT_START_KEYS  = ("startTime", "startAt", "start_time", "start")
+
+
+async def _fetch_contact_tags_ex(contact_id: str) -> tuple[bool, list[str]]:
+    """(ok, tags). ok=False means the lookup could not be trusted."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(f"{GHL_API_BASE}/contacts/{contact_id}",
+                                 headers=_ghl_headers(_GHL_HEADERS_V2))
+        if not r.is_success:
+            return False, []
+        data    = r.json()
+        contact = data.get("contact") or data
+        if not isinstance(contact, dict):
+            return False, []
+        return True, [str(t) for t in (contact.get("tags") or [])]
+    except Exception as err:
+        log.warning(f"[{contact_id}] booked-guard: tags lookup failed: {err}")
+        return False, []
+
+
+async def _fetch_opportunity_stage_ex(contact_id: str) -> tuple[bool, str]:
+    """
+    (ok, stage_name). ok=True with "" means the contact genuinely has no
+    opportunity — distinct from a failed lookup, which returns ok=False.
+    That distinction is the whole point: the pre-existing
+    fetch_ghl_opportunity_stage() collapses both cases to "".
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(
+                f"{GHL_API_BASE}/opportunities/search",
+                headers=_ghl_headers(_GHL_HEADERS_V2),
+                params={"location_id": GHL_LOCATION_ID, "contact_id": contact_id},
+            )
+        if not r.is_success:
+            return False, ""
+        data = r.json()
+        if not isinstance(data, dict):
+            return False, ""
+        opportunities = data.get("opportunities") or []
+        if not opportunities:
+            return True, ""          # no opportunity — a real, clean answer
+        opp = opportunities[0]
+        stage = (
+            (opp.get("pipelineStage") or {}).get("name") or
+            opp.get("stageName") or opp.get("stage_name") or ""
+        )
+        return True, str(stage).strip()
+    except Exception as err:
+        log.warning(f"[{contact_id}] booked-guard: opportunity lookup failed: {err}")
+        return False, ""
+
+
+def _appointment_is_active(appt: dict, now_utc: datetime) -> bool:
+    """
+    An appointment counts as booked when it is not cancelled AND starts in
+    the future.
+
+    Deliberately asymmetric: a status we do not recognise counts as ACTIVE.
+    Misreading an unknown status as free-to-text violates the invariant;
+    misreading it as booked only costs one suppressed message.
+    """
+    status = ""
+    for k in _APPT_STATUS_KEYS:
+        if appt.get(k):
+            status = str(appt[k]).lower().strip().replace(" ", "")
+            break
+    if status in _APPT_DEAD_STATUSES:
+        return False
+
+    raw_start = ""
+    for k in _APPT_START_KEYS:
+        if appt.get(k):
+            raw_start = str(appt[k])
+            break
+    if not raw_start:
+        # Active status but no parseable start time — cannot prove it is past,
+        # so treat as active.
+        return True
+    try:
+        txt = raw_start.replace("Z", "+00:00")
+        dt  = datetime.fromisoformat(txt)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt > now_utc
+    except Exception:
+        return True          # unparseable → assume active
+
+
+async def _fetch_appointments_ex(contact_id: str) -> tuple[bool, bool, str]:
+    """
+    (ok, has_active_future_appointment, detail).
+
+    A 200 whose body contains no recognisable list container returns ok=False.
+    Reading an unfamiliar response shape as "zero appointments" would be a
+    silent false negative — the most dangerous outcome available here.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(f"{GHL_API_BASE}/contacts/{contact_id}/appointments",
+                                 headers=_ghl_headers(_GHL_HEADERS_V1))
+        if not r.is_success:
+            return False, False, f"http_{r.status_code}"
+        data = r.json()
+
+        appts = None
+        if isinstance(data, list):
+            appts = data
+        elif isinstance(data, dict):
+            for k in _APPT_LIST_KEYS:
+                if isinstance(data.get(k), list):
+                    appts = data[k]
+                    break
+        if appts is None:
+            return False, False, "unrecognised_response_shape"
+
+        now_utc = datetime.now(timezone.utc)
+        active  = [a for a in appts if isinstance(a, dict)
+                   and _appointment_is_active(a, now_utc)]
+        return True, bool(active), f"total={len(appts)} active_future={len(active)}"
+    except Exception as err:
+        log.warning(f"[{contact_id}] booked-guard: appointments lookup failed: {err}")
+        return False, False, f"exception:{type(err).__name__}"
+
+
+async def booked_verdict(contact_id: str) -> tuple[Optional[bool], str]:
+    """
+    Authoritative booked check, straight from GHL. Never raises.
+
+      True  — booked. Suppress guarded sends.
+      False — CONFIRMED not booked. All three sources answered and were clean.
+      None  — indeterminate. Suppress guarded sends (fail safe).
+
+    Reads no webhook payload and no process memory.
+    """
+    if not contact_id:
+        return None, "no_contact_id"
+    if not GHL_API_KEY:
+        return None, "no_api_key"
+
+    results = await asyncio.gather(
+        _fetch_contact_tags_ex(contact_id),
+        _fetch_opportunity_stage_ex(contact_id),
+        _fetch_appointments_ex(contact_id),
+        return_exceptions=True,
+    )
+    tags_res, stage_res, appt_res = results
+
+    tags_ok,  tags        = (False, [])   if isinstance(tags_res,  BaseException) else tags_res
+    stage_ok, stage       = (False, "")   if isinstance(stage_res, BaseException) else stage_res
+    if isinstance(appt_res, BaseException):
+        appt_ok, has_appt, appt_detail = False, False, "exception"
+    else:
+        appt_ok, has_appt, appt_detail = appt_res
+
+    # ── Positive evidence: any single source is decisive ──────────────
+    positives: list[str] = []
+    if tags_ok and is_already_booked(tags):
+        positives.append("tag")
+    if stage_ok and stage in GHL_BOOKED_STAGES:
+        positives.append(f"stage={stage!r}")
+    if appt_ok and has_appt:
+        positives.append(f"appointment({appt_detail})")
+    if positives:
+        return True, " + ".join(positives)
+
+    # ── Negative requires ALL THREE to have answered ──────────────────
+    if tags_ok and stage_ok and appt_ok:
+        _stage_txt = stage or "none"
+        return False, f"clean(tags={len(tags)}, stage={_stage_txt!r}, {appt_detail})"
+
+    return None, (f"indeterminate(tags_ok={tags_ok}, stage_ok={stage_ok}, "
+                  f"appt_ok={appt_ok}, appt={appt_detail})")
+
+
+def _snapshot_conversation(state: dict) -> dict:
+    """
+    [DELIVERY] Capture the fields a send would advance, so they can be undone
+    when the message never actually left.
+
+    State is still advanced BEFORE the await (the original race fix: a second
+    concurrent webhook must see the new stage). This snapshot only makes that
+    advance reversible.
+    """
+    return {
+        "stage"             : state.get("stage"),
+        "messages"          : list(state.get("messages") or []),
+        "msgs_today"        : state.get("msgs_today", 0),
+        "location_confirmed": state.get("location_confirmed", False),
+        "entry_path"        : state.get("entry_path", "unknown"),
+    }
+
+
+def _rollback_conversation(contact_id: str, state: dict, snap: dict,
+                           result: dict, what: str) -> None:
+    """
+    [DELIVERY] Undo an advance whose message never left.
+
+    Applied ONLY for SUPPRESSED and REJECTED — never for ACCEPTED. An accepted
+    message is in flight and will usually arrive; rewinding it would re-ask the
+    same question when it does.
+    """
+    state.update(snap)
+    state["last_send_status"] = result.get("status", SendStatus.REJECTED.value)
+    save_state(contact_id, state)
+    ev(
+        "SEND_NOT_DELIVERED_STATE_ROLLED_BACK", contact_id,
+        what=what,
+        status=result.get("status"),
+        reason=result.get("reason") or result.get("why") or "(none)",
+        restored_stage=str(snap.get("stage")),
+    )
+
+
+def _record_send_result(contact_id: str, state: dict, result: dict) -> None:
+    """[DELIVERY] Persist the outcome of an accepted send."""
+    state["last_send_status"] = result.get("status", SendStatus.ACCEPTED.value)
+    state["last_message_id"]  = result.get("message_id", "") or ""
+    save_state(contact_id, state)
+
+
+def classify_reply_kind(state: dict) -> SendKind:
+    """
+    The generic agent-reply path carries qualification replies, booked-contact
+    replies and STOP confirmations, so its class must be derived per message.
+    """
+    if state.get("stage") == Stage.DNC:
+        return SendKind.OPT_OUT
+    if state.get("appointment_booked") or state.get("stage") == Stage.BOOKED:
+        return SendKind.BOOKED_REPLY
+    return SendKind.QUALIFICATION
+
+
+async def send_sms_via_ghl(contact_id: str, message: str, to_number: str = "",
+                           *, kind: SendKind = SendKind.QUALIFICATION) -> dict:
     """
     Send an outbound SMS through GHL's Conversations API.
     Includes outbound dedup [ADAPT-6] to prevent duplicate sends.
@@ -3782,11 +4181,57 @@ async def send_sms_via_ghl(contact_id: str, message: str, to_number: str = "") -
     Raises httpx.HTTPStatusError on 4xx/5xx GHL responses so callers
     can catch and decide whether to retry or abort.
     """
+    # ══════════════════════════════════════════════════════════════
+    #  [BOOKED-GUARD] Final authoritative check before the API call.
+    #
+    #  Runs AFTER outbound dedup (free, no network) and BEFORE the POST.
+    #  This is the last point at which a message can be stopped, and the
+    #  only one that consults GHL rather than the caller.
+    #
+    #  `kind` defaults to QUALIFICATION — the guarded value — so any call
+    #  site added later without an explicit class is protected by default.
+    # ══════════════════════════════════════════════════════════════
+    if kind in _BOOKED_GUARDED:
+        _verdict, _why = await booked_verdict(contact_id)
+        if _verdict is not False:          # True (booked) OR None (unknown)
+            ev(
+                "SEND_SUPPRESSED_BOOKED", contact_id,
+                kind=kind.value,
+                verdict=("booked" if _verdict else "indeterminate"),
+                why=_why,
+            )
+            return {
+                "status"       : SendStatus.SUPPRESSED.value,
+                "accepted"     : False,
+                "delivered"    : None,
+                "message_id"   : "",
+                "sent"         : False,
+                "suppressed"   : True,
+                "reason"       : "booked_guard",
+                "verdict"      : _verdict,
+                "why"          : _why,
+                "deduped"      : False,
+                "status_code"  : None,
+                "response_body": None,
+            }
+        ev("SEND_ALLOWED_NOT_BOOKED", contact_id, kind=kind.value, why=_why)
+
     # ── Outbound duplicate suppression [ADAPT-6] ──────────────────
     if is_duplicate_outbound(contact_id, message):
         print(f"\n[DUPLICATE] ⚡ Outbound dedup — same message to {contact_id} already sent this minute — SKIPPING")
         log.warning(f"[{contact_id}] Outbound duplicate suppressed: {message[:80]!r}")
-        return {"sent": False, "deduped": True, "status_code": None, "response_body": None}
+        return {
+            "status"       : SendStatus.SUPPRESSED.value,
+            "accepted"     : False,
+            "delivered"    : None,
+            "message_id"   : "",
+            "sent"         : False,
+            "suppressed"   : True,
+            "reason"       : "outbound_dedup",
+            "deduped"      : True,
+            "status_code"  : None,
+            "response_body": None,
+        }
 
     # ── [FIX-6] Last-line-of-defence URL sanitiser ─────────────────
     # Catches any LeadConnector booking URL that somehow survived to this
@@ -3867,8 +4312,35 @@ async def send_sms_via_ghl(contact_id: str, message: str, to_number: str = "") -
     print(f"{'='*64}\n")
 
     if r.is_success:
-        log.info(f"[{contact_id}] SMS sent via GHL: status={r.status_code} to={_resolved_to_number!r}")
-        return {"sent": True, "deduped": False, "status_code": r.status_code, "response_body": resp_body}
+        # ── [DELIVERY] ACCEPTED, not delivered ────────────────────────
+        # GHL has queued the message. The carrier may still reject it
+        # (e.g. 30007) minutes later. Nothing here proves it arrived.
+        _msg_id = ""
+        if isinstance(resp_body, dict):
+            _nested = resp_body.get("message")
+            _cands = [
+                resp_body.get("messageId"),
+                resp_body.get("messageid"),
+                resp_body.get("msgId"),
+                resp_body.get("id"),
+                (_nested or {}).get("id") if isinstance(_nested, dict) else None,
+            ]
+            _msg_id = next((str(c) for c in _cands if c), "")
+        log.info(f"[{contact_id}] SMS ACCEPTED by GHL: status={r.status_code} "
+                 f"message_id={_msg_id!r} to={_resolved_to_number!r}")
+        ev("SMS_ACCEPTED", contact_id, kind=kind.value, message_id=_msg_id or "(none)",
+           http=r.status_code, note="queued_not_delivered")
+        return {
+            "status"       : SendStatus.ACCEPTED.value,
+            "accepted"     : True,
+            "delivered"    : None,        # unknown until a delivery feed exists
+            "message_id"   : _msg_id,
+            "sent"         : True,        # backward-compat alias for accepted
+            "suppressed"   : False,
+            "deduped"      : False,
+            "status_code"  : r.status_code,
+            "response_body": resp_body,
+        }
     else:
         log.error(
             f"[{contact_id}] GHL SMS rejected: status={r.status_code} "
@@ -3876,7 +4348,17 @@ async def send_sms_via_ghl(contact_id: str, message: str, to_number: str = "") -
         )
         r.raise_for_status()
         # raise_for_status() always raises here; this return is for type-checker only
-        return {"sent": False, "deduped": False, "status_code": r.status_code, "response_body": resp_body}
+        return {
+            "status"       : SendStatus.REJECTED.value,
+            "accepted"     : False,
+            "delivered"    : False,
+            "message_id"   : "",
+            "sent"         : False,
+            "suppressed"   : False,
+            "deduped"      : False,
+            "status_code"  : r.status_code,
+            "response_body": resp_body,
+        }
 
 
 async def update_ghl_contact(contact_id: str, tags: list[str]):
@@ -4633,19 +5115,25 @@ async def inbound_webhook(request: Request):
         # current payload itself contains explicit booking fields — meaning GHL is
         # firing an appointment event that happens to also match the widget signals.
         # Tag-only or state-only booked signals are suppressed for widget leads.
+        # [BOOKED-GUARD] Authoritative evidence outranks payload shape.
+        # _ghl_stage is fetched from GHL earlier in this handler and was
+        # previously computed but never consulted here.
+        _authoritative_booked = bool(_tag_says_booked or (_ghl_stage in GHL_BOOKED_STAGES))
+
         _is_fresh_form_sub = (
-            _is_lead_payload and       # positively identified as widget/form lead
-            not _payload_says_booked   # no explicit booking proof in this payload
+            _is_lead_payload and         # positively identified as widget/form lead
+            not _payload_says_booked and # no explicit booking proof in this payload
+            not _authoritative_booked    # [BOOKED-GUARD] never override GHL evidence
         )
         if _is_fresh_form_sub:
             _is_booked_contact    = False
             _fresh_form_override  = True
             _booked_override_reason = (
                 f"[FIX-4.A] fresh_form_override — "
-                f"is_lead_payload=True + payload_says_booked=False → "
-                f"NEW_LEAD_PATH forced "
-                f"(tag_says_booked={_tag_says_booked} suppressed, "
-                f"state_says_booked={_state_says_booked} suppressed)"
+                f"is_lead_payload=True + payload_says_booked=False + "
+                f"authoritative_booked=False → NEW_LEAD_PATH forced "
+                f"(stale state_says_booked={_state_says_booked} suppressed; "
+                f"GHL tag/stage evidence was absent, not ignored)"
             )
         else:
             _is_booked_contact    = (
@@ -5010,7 +5498,8 @@ async def inbound_webhook(request: Request):
                     _bill_ack_result: dict = {}
                     try:
                         _bill_ack_result = await send_sms_via_ghl(
-                            contact_id, ack, to_number=_ack_phone
+                            contact_id, ack, to_number=_ack_phone,
+                            kind=SendKind.BILL_ACK,          # booked-exempt
                         )
                     except Exception as sms_err:
                         _tb = traceback.format_exc()
@@ -5135,7 +5624,8 @@ async def inbound_webhook(request: Request):
                 _followup_result: dict = {}
                 try:
                     _followup_result = await send_sms_via_ghl(
-                        contact_id, _followup_reply, to_number=_fp_phone
+                        contact_id, _followup_reply, to_number=_fp_phone,
+                        kind=SendKind.BOOKED_REPLY,          # booked-exempt
                     )
                 except Exception as sms_err:
                     _tb = traceback.format_exc()
@@ -5249,7 +5739,8 @@ async def inbound_webhook(request: Request):
             _bill_reminder_result: dict = {}
             try:
                 _bill_reminder_result = await send_sms_via_ghl(
-                    contact_id, reminder, to_number=_send_to_number
+                    contact_id, reminder, to_number=_send_to_number,
+                    kind=SendKind.BOOKED_REPLY,              # booked-exempt
                 )
             except Exception as sms_err:
                 _tb = traceback.format_exc()
@@ -5492,7 +5983,10 @@ async def inbound_webhook(request: Request):
                 )
                 print(f"[ROUTING] First-outreach: {outreach!r}")
 
-                # Race-fix: advance stage + store history BEFORE the async send
+                # Race-fix: advance stage + store history BEFORE the async send.
+                # [DELIVERY] Snapshot first so the advance is reversible when the
+                # message turns out never to have left.
+                _snap = _snapshot_conversation(state)
                 state["stage"]              = Stage.ASK_OWNERSHIP
                 state["location_confirmed"] = True  # address from form → skip area question
                 increment_message_count(state)
@@ -5510,15 +6004,46 @@ async def inbound_webhook(request: Request):
                 save_state(contact_id, state)
 
                 try:
-                    await send_sms_via_ghl(contact_id, outreach, to_number=phone)
+                    _send = await send_sms_via_ghl(contact_id, outreach, to_number=phone,
+                                                   kind=SendKind.OUTREACH)
                 except Exception as sms_err:
                     log.error(f"[{contact_id}] First-outreach SMS failed: {sms_err}")
                     print(f"[ERROR] First-outreach SMS failed:\n{traceback.format_exc()}")
-                    return JSONResponse({"status": "success", "note": "first-outreach SMS failed"})
+                    _rollback_conversation(contact_id, state, _snap,
+                                           {"status": SendStatus.REJECTED.value,
+                                            "reason": f"exception:{type(sms_err).__name__}"},
+                                           "first_outreach")
+                    ev("FIRST_OUTREACH_NOT_SENT", contact_id, phone=phone,
+                       status=SendStatus.REJECTED.value, reason="exception")
+                    return JSONResponse({"status": "success", "note": "first-outreach SMS failed",
+                                         "sms_status": SendStatus.REJECTED.value})
 
-                print(f"[SMS] ✅ First-outreach sent to {full_name!r}")
-                # [META-B1] Durable marker — makes the suppression above work
-                # across restarts and duplicate Meta submissions.
+                # ── [DELIVERY] Only an ACCEPTED send may be booked as outreach ──
+                # Previously the result was discarded: a suppressed or rejected
+                # message still advanced the stage, appended the question to
+                # Claude's history and wrote ai-outreach-sent — so the system
+                # believed a lead had been contacted when it had not.
+                if _send.get("status") not in _STATUS_ADVANCES_STATE:
+                    _rollback_conversation(contact_id, state, _snap, _send, "first_outreach")
+                    ev(
+                        "FIRST_OUTREACH_NOT_SENT", contact_id,
+                        phone=phone,
+                        status=_send.get("status"),
+                        reason=_send.get("reason") or _send.get("why") or "(none)",
+                        note="state_rolled_back; ai-outreach-sent NOT written",
+                    )
+                    return JSONResponse({
+                        "status"    : "success",
+                        "replied"   : False,
+                        "sms_status": _send.get("status"),
+                        "reason"    : _send.get("reason") or _send.get("why"),
+                    })
+
+                _record_send_result(contact_id, state, _send)
+                print(f"[SMS] ✅ First-outreach ACCEPTED by GHL for {full_name!r}")
+                # [META-B1] Durable marker — written ONLY after acceptance, so a
+                # lead whose first SMS never left is not marked as outreached
+                # (which would also start the GHL nurture sequence).
                 try:
                     await add_ghl_tags(contact_id, [TAG_OUTREACH_SENT])
                 except Exception as _ot_err:
@@ -5528,6 +6053,8 @@ async def inbound_webhook(request: Request):
                     phone=phone,
                     meta=is_meta_lead(lead_source, tags),
                     path="form_submission",
+                    status=_send.get("status"),
+                    message_id=_send.get("message_id") or "(none)",
                 )
                 return JSONResponse({"status": "success", "replied": True, "reply": outreach, "payload_type": "form_submission_new_contact"})
 
@@ -5555,7 +6082,8 @@ async def inbound_webhook(request: Request):
                 print(f"[BOOKED]  Message variant    : {_bm2_variant!r} | template={_bm2_tpl_key!r} | entry_path={_ep2!r}")
                 print(f"[BOOKED]  Message text       : {reminder!r}")
                 try:
-                    await send_sms_via_ghl(contact_id, reminder, to_number=state.get("phone", "") or phone)
+                    await send_sms_via_ghl(contact_id, reminder, to_number=state.get("phone", "") or phone,
+                                           kind=SendKind.BOOKED_REPLY)
                 except Exception as sms_err:
                     log.error(f"[{contact_id}] Bill reminder (SEND_BOOKING) failed: {sms_err}")
                     print(f"[ERROR] Bill reminder SMS failed:\n{traceback.format_exc()}")
@@ -5635,7 +6163,8 @@ async def inbound_webhook(request: Request):
             log.info(f"[{contact_id}] MMS attachment received — sending ack")
             if not is_duplicate_outbound(contact_id, _mms_ack):
                 try:
-                    await send_sms_via_ghl(contact_id, _mms_ack, to_number=state.get("phone", "") or phone)
+                    await send_sms_via_ghl(contact_id, _mms_ack, to_number=state.get("phone", "") or phone,
+                                           kind=SendKind.BILL_ACK)
                     print(f"[SMS] \u2705 MMS ack sent to {full_name!r}")
                 except Exception as _mms_err:
                     log.error(f"[{contact_id}] MMS ack SMS failed: {_mms_err}")
@@ -5729,7 +6258,17 @@ async def inbound_webhook(request: Request):
             save_state(contact_id, state)
 
             try:
-                await send_sms_via_ghl(contact_id, outreach, to_number=phone)
+                _send = await send_sms_via_ghl(contact_id, outreach, to_number=phone,
+                                               kind=SendKind.OUTREACH)
+                if _send.get("status") not in _STATUS_ADVANCES_STATE:
+                    ev("FIRST_OUTREACH_NOT_SENT", contact_id, path="real_message",
+                       status=_send.get("status"),
+                       reason=_send.get("reason") or _send.get("why") or "(none)")
+                else:
+                    _record_send_result(contact_id, state, _send)
+                    ev("FIRST_OUTREACH_SENT", contact_id, path="real_message",
+                       status=_send.get("status"),
+                       message_id=_send.get("message_id") or "(none)")
             except Exception as sms_err:
                 log.error(f"[{contact_id}] First-outreach (chat_widget real msg) SMS failed: {sms_err}")
                 print(f"[ERROR] First-outreach SMS failed:\n{traceback.format_exc()}")
@@ -5790,7 +6329,8 @@ async def inbound_webhook(request: Request):
             log.info(f"[{contact_id}] Booked bill photo ack | stage={_ghl_stage!r}")
             if not is_duplicate_outbound(contact_id, _bill_ack):
                 try:
-                    await send_sms_via_ghl(contact_id, _bill_ack, to_number=_ack_phone)
+                    await send_sms_via_ghl(contact_id, _bill_ack, to_number=_ack_phone,
+                                           kind=SendKind.BILL_ACK)
                 except Exception as _ack_err:
                     print(f"[PIPELINE] ❌ Bill ack send failed: {_ack_err}", flush=True)
             return JSONResponse({"status": "success", "action": "bill_photo_ack", "stage": _ghl_stage})
@@ -5842,7 +6382,8 @@ async def inbound_webhook(request: Request):
                 log.warning(f"[{contact_id}] FAILSAFE: sending tech hiccup SMS (agent None, stage={_post_stage_val})")
                 if not is_duplicate_outbound(contact_id, _failsafe_msg):
                     try:
-                        await send_sms_via_ghl(contact_id, _failsafe_msg, to_number=_failsafe_phone)
+                        await send_sms_via_ghl(contact_id, _failsafe_msg, to_number=_failsafe_phone,
+                                               kind=SendKind.SYSTEM)
                         print(f"[FAILSAFE] ✅ Recovery SMS sent to {full_name!r} ({contact_id})", flush=True)
                     except Exception as _fs_err:
                         print(f"[FAILSAFE] ❌ Recovery SMS failed: {_fs_err}", flush=True)
@@ -5884,11 +6425,48 @@ async def inbound_webhook(request: Request):
 
         # ── Send SMS ──────────────────────────────────────────────
         try:
-            await send_sms_via_ghl(contact_id, reply, to_number=contact_phone)
+            _reply_kind = classify_reply_kind(state)
+            _send = await send_sms_via_ghl(contact_id, reply, to_number=contact_phone,
+                                           kind=_reply_kind)
+            # ── [DELIVERY] Record what actually happened ──────────────────
+            # The reply was already appended to state["messages"] inside
+            # michael_agent(). We do NOT rewind that for an ACCEPTED send —
+            # the message is in flight and rewinding risks a duplicate reply
+            # if it lands. We DO record the true status so nothing downstream
+            # mistakes "queued" for "the homeowner read it".
+            _record_send_result(contact_id, state, _send)
+            if _send.get("status") not in _STATUS_ADVANCES_STATE:
+                ev(
+                    "REPLY_NOT_SENT", contact_id,
+                    kind=_reply_kind.value,
+                    status=_send.get("status"),
+                    reason=_send.get("reason") or _send.get("why") or "(none)",
+                    note="homeowner did NOT receive this question",
+                )
+            else:
+                ev(
+                    "REPLY_ACCEPTED", contact_id,
+                    kind=_reply_kind.value,
+                    message_id=_send.get("message_id") or "(none)",
+                )
         except Exception as sms_err:
             log.error(f"[{contact_id}] GHL SMS send failed: {sms_err}")
             print(f"[REPLY] !! SMS send FAILED — lead reply not delivered", flush=True)
             print(f"[ERROR] SMS send failed:\n{traceback.format_exc()}")
+            # [DELIVERY] An exception here means GHL refused the message outright.
+            # Record that truthfully — without it the contact keeps whatever status
+            # the PREVIOUS successful send left behind, so a failed reply would
+            # still read as "accepted".
+            try:
+                _record_send_result(contact_id, state, {
+                    "status": SendStatus.REJECTED.value, "message_id": "",
+                })
+                ev("REPLY_NOT_SENT", contact_id,
+                   status=SendStatus.REJECTED.value,
+                   reason=f"exception:{type(sms_err).__name__}",
+                   note="homeowner did NOT receive this question")
+            except Exception:
+                pass
             return JSONResponse({
                 "status"         : "success",
                 "replied"        : False,
@@ -5955,7 +6533,12 @@ async def inbound_webhook(request: Request):
                 _fb_state["messages"].append({"role": "assistant", "content": _fb_outreach})
                 save_state(contact_id, _fb_state)
                 try:
-                    await send_sms_via_ghl(contact_id, _fb_outreach, to_number=_fb_phone)
+                    _send = await send_sms_via_ghl(contact_id, _fb_outreach, to_number=_fb_phone,
+                                                   kind=SendKind.OUTREACH)
+                    ev("FIRST_OUTREACH_SENT" if _send.get("status") in _STATUS_ADVANCES_STATE
+                       else "FIRST_OUTREACH_NOT_SENT", contact_id, path="fallback",
+                       status=_send.get("status"),
+                       message_id=_send.get("message_id") or "(none)")
                     print(f"[FALLBACK] ✅ Fallback first-outreach sent to {full_name!r} ({contact_id})")
                     log.info(f"[{contact_id}] Fallback first-outreach sent | unknown event | phone={_fb_phone!r}")
                     return JSONResponse({
@@ -6126,7 +6709,8 @@ async def booking_followup(request: Request):
 
         _result: dict = {}
         try:
-            _result = await send_sms_via_ghl(contact_id, appt_confirmation, to_number=phone)
+            _result = await send_sms_via_ghl(contact_id, appt_confirmation, to_number=phone,
+                                             kind=SendKind.BOOKED_REPLY)
         except Exception as sms_err:
             _tb = traceback.format_exc()
             print(f"\n[BOOKING-FOLLOWUP SMS RESULT]  ❌ EXCEPTION — SMS NOT sent")
@@ -6170,6 +6754,119 @@ async def booking_followup(request: Request):
     except Exception as err:
         log.error(f"booking-followup fatal error: {err}")
         print(f"[ERROR] booking-followup FATAL:\n{traceback.format_exc()}")
+        return JSONResponse({"status": "success", "error_logged": True})
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  [DELIVERY-2] OUTBOUND DELIVERY-STATUS RECEIVER
+#
+#  WHY
+#    GHL's POST /conversations/messages returns 2xx when it ACCEPTS a message
+#    for sending. Carrier filtering (error 30007, "Message filtered") happens
+#    afterwards and is never visible in that response. Without this route the
+#    agent believes every accepted message arrived — so it advances the
+#    conversation and asks the next question even though the homeowner never
+#    saw the previous one.
+#
+#  MECHANISM (documented, not guessed)
+#    GHL exposes a native workflow trigger, "Messaging Error Code - SMS",
+#    which fires on an undelivered message and supports 30007 among its
+#    error codes. A Webhook action on that workflow POSTs here.
+#
+#  WHAT THIS DOES NOT DO
+#    It never resends. A filtered message resent unchanged fails again and
+#    damages sender reputation. It records the truth, flags the contact for
+#    a human, and stops.
+#
+#  It also never rewinds the conversation stage. Rewinding would let the next
+#  inbound re-trigger the same question — an automatic retry by another name.
+# ═════════════════════════════════════════════════════════════════════════
+
+@app.post("/webhook/message-status")
+async def message_status_webhook(request: Request):
+    """
+    Receives outbound delivery failures from GHL.
+
+    Tolerant of payload shape: GHL's docs do not specify which fields the
+    trigger exposes, so every field is optional except a contact id. Always
+    returns 200 — a non-200 makes GHL retry, which would double-count.
+    """
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            _raw = (await request.body()).decode("utf-8", errors="replace")
+            body = dict(parse_qs(_raw)) if _raw else {}
+        if not isinstance(body, dict):
+            body = {}
+
+        def _pick(*keys) -> str:
+            for k in keys:
+                v = body.get(k)
+                if isinstance(v, list):
+                    v = v[0] if v else None
+                if v not in (None, "", []):
+                    return str(v).strip()
+            return ""
+
+        contact_id = _pick("contactId", "contact_id", "contact", "id")
+        error_code = _pick("errorCode", "error_code", "code", "messagingErrorCode")
+        message_id = _pick("messageId", "message_id", "msgId")
+        status_txt = _pick("status", "messageStatus", "message_status") or "undelivered"
+
+        if not contact_id:
+            ev("DELIVERY_STATUS_MALFORMED", "", keys=sorted(body.keys())[:12],
+               note="no contact id — ignored, no state changed")
+            return JSONResponse({"status": "success", "ignored": True,
+                                 "reason": "no_contact_id"})
+
+        kind = classify_carrier_error(error_code)
+        state = get_state(contact_id)
+        _prev_status = state.get("last_send_status")
+
+        # Record the truth. The stage is deliberately left where it is.
+        state["last_send_status"]  = SendStatus.FAILED.value
+        state["undelivered_count"] = int(state.get("undelivered_count", 0)) + 1
+        if message_id:
+            state["last_message_id"] = message_id
+        save_state(contact_id, state)
+
+        ev(
+            "DELIVERY_FAILED", contact_id,
+            error_code=error_code or "(none)",
+            classification=kind,
+            message_id=message_id or "(none)",
+            carrier_status=status_txt,
+            previous_status=_prev_status,
+            stage=str(state.get("stage")),
+            undelivered_count=state["undelivered_count"],
+            retry="never",
+        )
+
+        # Flag for a human. Additive and non-fatal.
+        try:
+            await add_ghl_tags(contact_id, [TAG_UNDELIVERABLE])
+        except Exception as _tag_err:
+            log.warning(f"[{contact_id}] undeliverable tag write failed: {_tag_err}")
+
+        if kind == "permanent":
+            ev("MANUAL_ATTENTION_REQUIRED", contact_id,
+               reason=f"permanent_carrier_failure_{error_code or 'unknown'}",
+               note="last question did NOT reach the homeowner; no automatic resend")
+
+        return JSONResponse({
+            "status"           : "success",
+            "recorded"         : True,
+            "contact_id"       : contact_id,
+            "error_code"       : error_code,
+            "classification"   : kind,
+            "undelivered_count": state["undelivered_count"],
+            "retried"          : False,
+        })
+
+    except Exception as err:
+        log.error(f"message-status webhook fatal: {err}")
+        print(f"[ERROR] message-status FATAL:\n{traceback.format_exc()}")
         return JSONResponse({"status": "success", "error_logged": True})
 
 
@@ -6478,7 +7175,8 @@ async def debug_send_test_sms(request: Request):
             return JSONResponse({"error": "contact_id is required"}, status_code=400)
 
         print(f"\n[DEBUG-SMS] Manual test SMS | contact={contact_id!r} | to={to_number!r}")
-        await send_sms_via_ghl(contact_id, message, to_number=to_number)
+        await send_sms_via_ghl(contact_id, message, to_number=to_number,
+                               kind=SendKind.SYSTEM)
         return JSONResponse({"status": "sent", "contact_id": contact_id, "to_number": to_number, "message": message})
 
     except Exception as err:
