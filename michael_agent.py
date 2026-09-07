@@ -2410,7 +2410,7 @@ def build_system_prompt(state: dict, ghl_pipeline_stage: str = "", ghl_tags: lis
         current_goal = "ASK BILL — ask what the Ameren bill usually runs, conversationally and open-ended (e.g. 'About what does the Ameren bill usually run you? Even a rough guess is fine.'). Do NOT offer bracket choices. Accept any natural phrasing ('around 170', '150ish', 'couple hundred') and move on. When they give you a number, do NOT comment on its size and do NOT mention rates or savings — acknowledge it in four words or fewer and go straight to your next question or to booking. $100+/month: clearly qualified. $75–99: borderline, worth reviewing. Under $75: likely not a fit — say so honestly."
     elif loc_conf and homeown != "yes":
         # Area confirmed — move to ownership question next
-        current_goal = "ASK OWNERSHIP — find out if they own the home."
+        current_goal = "ASK OWNERSHIP — ask 'Are you the homeowner?' (use that phrasing)."
     elif homeown == "yes" and not loc_conf:
         # Homeowner confirmed (volunteered early) but utility/area not yet checked
         current_goal = "ASK UTILITY — confirm they are an Ameren Missouri customer in the St. Louis area (Missouri side only)."
@@ -2422,7 +2422,7 @@ def build_system_prompt(state: dict, ghl_pipeline_stage: str = "", ghl_tags: lis
         # Widget leads have location_confirmed=True from form submission, so if
         # loc_conf is False here, utility was the unanswered first question.
         if loc_conf:
-            current_goal = "ASK OWNERSHIP — find out if they own the home."
+            current_goal = "ASK OWNERSHIP — ask 'Are you the homeowner?' (use that phrasing)."
         else:
             current_goal = "ASK UTILITY — confirm they are an Ameren Missouri customer in the St. Louis area (Missouri side only)."
 
@@ -2457,7 +2457,7 @@ def build_system_prompt(state: dict, ghl_pipeline_stage: str = "", ghl_tags: lis
         elif ghl_pipeline_stage == "Contacted" and current_goal.startswith("ASK UTILITY"):
             # 'Contacted' means we already reached them — skip utility re-ask if loc_conf is True
             if loc_conf:
-                current_goal = "ASK OWNERSHIP — location already confirmed. Find out if they own the home."
+                current_goal = "ASK OWNERSHIP — location already confirmed. Ask 'Are you the homeowner?' (use that phrasing)."
 
     return f"""You are Michael, a solar advisor for STL Energy Advisors, serving St. Louis-area Missouri homeowners on Ameren Missouri.
 Your one job: qualify leads and book them for a free in-home solar consultation.
@@ -2477,7 +2477,10 @@ QUALIFICATION ORDER — skip any step already confirmed above:
        "Got it — we focus on Ameren Missouri homeowners on the Missouri side of the St. Louis area, so we may not be the right fit yet. I'll keep your info on file in case anything changes." [DISQUALIFY:OUT_OF_AREA]
 
 2. OWN THE HOME?
-   Ask: "Do you own the home?"
+   Ask: "Are you the homeowner?" — use this phrasing.
+   Do NOT rephrase as "do you own the home" / "do you own your home". Those
+   variants have been blocked by carrier filters (error 30007) on multiple
+   contacts, while the questions either side of them delivered normally.
    → Owner: continue
    → Renter: "Got it — solar really only works for homeowners. If that ever changes, reach out." [DISQUALIFY:NOT_OWNER]
 
