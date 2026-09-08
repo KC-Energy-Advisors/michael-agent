@@ -4151,6 +4151,93 @@ def _record_send_result(contact_id: str, state: dict, result: dict) -> None:
     save_state(contact_id, state)
 
 
+# ═════════════════════════════════════════════════════════════════════════
+#  [STAGE-RESTORE] Durable stage recovery from GHL evidence
+#
+#  WHY
+#    _state_store is process memory and is wiped by every restart and deploy.
+#    A contact who had completed qualification and received the booking link
+#    replied "Ok" the next morning, was read back as Stage.INITIAL, and was
+#    asked the ownership question again. He replied STOP.
+#
+#    The recovery branch that handled this assumed "engaged but no state"
+#    meant mid-qualification and hardcoded Stage.ASK_OWNERSHIP. It had no way
+#    to know the contact had progressed further.
+#
+#    The evidence was in GHL the whole time. resolve_ghl_tags() writes
+#    QUALIFIED and BOOKING_LINK_SENT when the booking link goes out, and
+#    fetch_ghl_opportunity_stage() is already called on every inbound. Neither
+#    was ever read back — ghl_stage_to_internal() was dead code.
+#
+#  RULE
+#    Return the FURTHEST stage the contact has durably reached. Ordered
+#    furthest-first, first match wins, so a contact can never be walked
+#    backwards into a question they have already answered.
+# ═════════════════════════════════════════════════════════════════════════
+
+# GHL contact tags written by resolve_ghl_tags() when the booking link is sent.
+_TAGS_QUALIFIED: tuple = ("BOOKING_LINK_SENT", "QUALIFIED")
+_TAGS_DISQUALIFIED: tuple = ("NOT_QUALIFIED",)
+
+
+def restore_stage_from_ghl(tags: list | None,
+                           ghl_stage: str = "") -> tuple[Optional[Stage], str]:
+    """
+    (stage, why) — the furthest stage supported by durable GHL evidence,
+    or (None, reason) when there is none. Reads only GHL data, never memory.
+    """
+    if has_tag(tags, TAG_DNC):
+        return Stage.DNC, "tag:solar-dnc"
+    if is_already_booked(list(tags or [])):
+        return Stage.BOOKED, "tag:booked"
+    if ghl_stage and ghl_stage in GHL_BOOKED_STAGES:
+        return Stage.BOOKED, f"pipeline:{ghl_stage}"
+
+    if any(has_tag(tags, t) for t in _TAGS_QUALIFIED):
+        return Stage.SEND_BOOKING, "tag:qualified/booking_link_sent"
+
+    # ghl_stage_to_internal() existed but was never called. "Qualified" maps
+    # to SEND_BOOKING, which is exactly the evidence that was being ignored.
+    _mapped = ghl_stage_to_internal(ghl_stage)
+    if _mapped in (Stage.SEND_BOOKING, Stage.BOOKED, Stage.DISQUALIFIED):
+        return _mapped, f"pipeline:{ghl_stage}"
+
+    if has_tag(tags, TAG_DISQUALIFIED) or any(has_tag(tags, t) for t in _TAGS_DISQUALIFIED):
+        return Stage.DISQUALIFIED, "tag:disqualified"
+
+    # Engaged, but no evidence of progress past qualification.
+    if has_tag(tags, TAG_ENGAGED) or has_tag(tags, TAG_OUTREACH_SENT):
+        return Stage.ASK_OWNERSHIP, "tag:engaged/outreach_sent"
+
+    return None, "no_durable_evidence"
+
+
+def apply_restored_stage(contact_id: str, state: dict,
+                         tags: list | None, ghl_stage: str = "") -> str:
+    """
+    Set state["stage"] from durable GHL evidence. Returns the reason string.
+
+    A contact restored to SEND_BOOKING or beyond has demonstrably answered the
+    qualification questions, so the facts those questions establish are marked
+    confirmed too — otherwise the prompt would re-ask them on the next turn.
+    """
+    _stage, _why = restore_stage_from_ghl(tags, ghl_stage)
+    if _stage is None:
+        _stage, _why = Stage.ASK_OWNERSHIP, "default:no_evidence"
+
+    state["stage"] = _stage
+    state["location_confirmed"] = True
+    if _stage in (Stage.SEND_BOOKING, Stage.BOOKED):
+        state["qualified"] = True
+        if not state.get("homeowner"):
+            state["homeowner"] = "yes"
+    if _stage == Stage.SEND_BOOKING:
+        state["booking_detected"] = True
+
+    ev("STAGE_RESTORED_FROM_GHL", contact_id, stage=str(_stage), why=_why)
+    return _why
+
+
 def classify_reply_kind(state: dict) -> SendKind:
     """
     The generic agent-reply path carries qualification replies, booked-contact
@@ -5944,8 +6031,10 @@ async def inbound_webhook(request: Request):
             if state["stage"] == Stage.INITIAL and (
                 has_tag(tags, TAG_ENGAGED) or has_tag(tags, TAG_OUTREACH_SENT)
             ):
-                state["stage"]              = Stage.ASK_OWNERSHIP
-                state["location_confirmed"] = True
+                # [STAGE-RESTORE] Recover the FURTHEST durable stage, not a
+                # hardcoded ASK_OWNERSHIP — a contact who already received the
+                # booking link must not be walked back into qualification.
+                _restore_why = apply_restored_stage(contact_id, state, tags, _ghl_stage)
                 if not state.get("entry_path") or state["entry_path"] == "unknown":
                     state["entry_path"] = "chat_widget"
                 save_state(contact_id, state)
@@ -5953,6 +6042,8 @@ async def inbound_webhook(request: Request):
                     "FIRST_OUTREACH_SUPPRESSED", contact_id,
                     reason="already_outreached_or_engaged",
                     path="form_submission",
+                    restored_stage=str(state["stage"]),
+                    restored_why=_restore_why,
                 )
                 return JSONResponse({
                     "status"      : "success",
@@ -6203,8 +6294,10 @@ async def inbound_webhook(request: Request):
         if state["stage"] == Stage.INITIAL and (
             has_tag(tags, TAG_ENGAGED) or has_tag(tags, TAG_OUTREACH_SENT)
         ):
-            state["stage"]              = Stage.ASK_OWNERSHIP
-            state["location_confirmed"] = True
+            # [STAGE-RESTORE] This is the branch that asked a fully-qualified
+            # contact "Are you the homeowner?" after a deploy wiped memory.
+            # Restore the furthest stage GHL can prove instead.
+            _restore_why = apply_restored_stage(contact_id, state, tags, _ghl_stage)
             if not state.get("entry_path") or state["entry_path"] == "unknown":
                 state["entry_path"] = "chat_widget"
             save_state(contact_id, state)
@@ -6212,6 +6305,8 @@ async def inbound_webhook(request: Request):
                 "FIRST_OUTREACH_SUPPRESSED", contact_id,
                 reason="already_outreached_or_engaged",
                 path="real_message",
+                restored_stage=str(state["stage"]),
+                restored_why=_restore_why,
             )
 
         if state["stage"] == Stage.INITIAL:
