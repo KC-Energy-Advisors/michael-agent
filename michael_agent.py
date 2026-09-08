@@ -2537,6 +2537,30 @@ ALWAYS still allowed — answering is not pitching:
 The distinction is simple: unsolicited promotional framing is prohibited;
 genuine answers to genuine questions are expected.
 
+━━ MATCH THEIR REGISTER ━━
+Mirror the homeowner's length and formality — never their slang.
+• Short and casual from them → short and casual from you. "Yep" earns a
+  one-liner, not a paragraph.
+• Longer, more detailed or more formal from them → you can be a little
+  fuller and more precise in return.
+• Never run hotter than they are. If they are flat or brief, be plain.
+  Do not add energy they did not bring.
+
+THEIR NAME
+Use it in the opening message. After that, leave it out unless it genuinely
+fits — addressing them directly, or picking the thread back up after a long
+gap. Do not open replies with their name as a habit.
+  Bad:  "Great, Gary! Thanks so much for that."
+  Good: "Got it."
+
+NEVER
+• Compliment, flatter, or thank them for something ordinary.
+• "Awesome", "Perfect!", "Fantastic", "Happy to help", "I'd love to".
+• Exclamation marks as a default setting.
+• Echo their slang or abbreviations back at them — it reads as mimicry.
+• Emojis, unless they used one first, and then at most one.
+Calm, competent, human. An advisor texting someone, not a rep working a lead.
+
 ━━ BEHAVIOR RULES ━━
 • 1-2 sentences per message max (3 only if truly necessary)
 • NEVER re-ask about anything listed as confirmed in "WHAT YOU ALREADY KNOW" above
@@ -3245,26 +3269,29 @@ def build_booking_message(first_name: str = "", full_name: str = "") -> str:
     NOT a "savings report". Honest framing per migration: if the math doesn't
     work for the home, we say so on the visit.
 
-    With first name:
-      "Great, {first}. Here's the calendar — pick whatever works and I'll come
-       by your home, look at your last 12 months of Ameren bills, and tell you
-       straight if solar makes sense for your roof or not.
+    Deliberately does NOT use the first name. It arrives immediately after the
+    homeowner has answered a question, so re-introducing them by name reads as
+    a template firing rather than a person replying. "Great, {name}" was the
+    single most canned line in the flow.
+
+    The 👍 is gone for the same reason — an emoji nobody asked for.
+
+    Output:
+      "Got it. Here's the calendar — pick whatever time works best and I'll
+       come by, walk you through the new solar program, compare solar against
+       your current Ameren bill, and answer any questions you have.
        {BOOKING_LINK}
-       Once you grab a time I'll shoot you a quick message before I come by 👍"
+       Once you grab a time, I'll send a quick confirmation before I head over."
+
+    first_name / full_name are still accepted so every existing caller keeps
+    working unchanged; they are simply no longer interpolated.
     """
-    first = _resolve_first_name(first_name, full_name)
-
-    if first:
-        opener = f"Great, {first}. Here's the calendar — pick whatever works"
-    else:
-        opener = "Great. Here's the calendar — pick whatever works"
-
     return (
-        f"{opener} and I'll come by your home, look at your last 12 months "
-        f"of Ameren bills, and tell you straight if solar makes sense for your "
-        f"roof or not.\n"
+        "Got it. Here's the calendar — pick whatever time works best and I'll "
+        "come by, walk you through the new solar program, compare solar against "
+        "your current Ameren bill, and answer any questions you have.\n"
         f"{BOOKING_LINK}\n\n"
-        f"Once you grab a time, I'll shoot you a quick message before I come by 👍"
+        "Once you grab a time, I'll send a quick confirmation before I head over."
     )
 
 
