@@ -735,6 +735,18 @@ TAG_DISQUALIFIED  = "solar-disqualified"
 #                  It does NOT suppress sending: the invariant is about
 #                  booked contacts, not undeliverable ones.
 TAG_UNDELIVERABLE = "sms-undeliverable"
+#   TAG_NUDGE_SENT — the one booking-link follow-up has been sent. Durable in
+#                  GHL, so a Render restart or a duplicate workflow firing
+#                  can never produce a second nudge.
+TAG_NUDGE_SENT    = "booking-nudge-sent"
+#   TAG_NUDGE_CANCELLED — a human has taken this conversation over. Set when
+#                  a manual follow-up goes out after the booking link, so the
+#                  homeowner never gets two follow-ups from us on the same day.
+#                  Python cannot see manual sends: they never reach
+#                  /webhook/inbound, and GHL's documented /conversations/search
+#                  returns lastMessageType but no date and no direction, so
+#                  there is nothing to compare against. This tag is the signal.
+TAG_NUDGE_CANCELLED = "ai-nudge-cancelled"
 
 # ── [DELIVERY-2] Carrier error taxonomy ──────────────────────────────────
 # Codes GHL surfaces through its "Messaging Error Code - SMS" workflow
@@ -3292,6 +3304,27 @@ def build_booking_message(first_name: str = "", full_name: str = "") -> str:
         "your current Ameren bill, and answer any questions you have.\n"
         f"{BOOKING_LINK}\n\n"
         "Once you grab a time, I'll send a quick confirmation before I head over."
+    )
+
+
+def build_booking_nudge() -> str:
+    """
+    The single follow-up for a lead who received the booking link and neither
+    booked nor replied.
+
+    No name: they are mid-conversation, so re-introducing them reads as a
+    template. No enthusiasm, no emoji, no claims, no dollar figures, no
+    urgency — this goes out roughly a day after a message that already
+    explained the offer, and it is a reminder, not a second pitch.
+
+    It also gives them an easy way out. A lead who says "not right now" is
+    worth more than one who feels chased.
+    """
+    return (
+        "Following up on that calendar link — still happy to come take a look "
+        "if you want to grab a time.\n"
+        f"{BOOKING_LINK}\n\n"
+        "If the timing isn't right, just let me know."
     )
 
 
@@ -6906,6 +6939,138 @@ async def booking_followup(request: Request):
 #  It also never rewinds the conversation stage. Rewinding would let the next
 #  inbound re-trigger the same question — an automatic retry by another name.
 # ═════════════════════════════════════════════════════════════════════════
+
+# ═════════════════════════════════════════════════════════════════════════
+#  [NUDGE] BOOKING-LINK FOLLOW-UP
+#
+#  THE GAP THIS FILLS
+#    The Meta nurture sequence is cancelled the moment a lead replies, because
+#    Michael writes ai-engaged on any real inbound and the GHL Nurture Cancel
+#    workflow removes them. So a lead who engages, qualifies, receives the
+#    booking link and then goes quiet had NO follow-up at all — the single
+#    most valuable non-booked state in the funnel.
+#
+#  OWNERSHIP
+#    GHL owns the 24-hour wait (it has durable timers; this process does not).
+#    Python owns the decision to send, because only it can consult the
+#    authoritative booked guard.
+#
+#  SUPPRESSION — checked in order, first match wins
+#    1. no contact id        -> ignore, log, change nothing
+#    2. tag lookup failed    -> DO NOT SEND (fail safe)
+#    3. solar-dnc            -> DO NOT SEND (booked_verdict does not cover DNC)
+#    4. booking-nudge-sent   -> DO NOT SEND (already nudged, durable in GHL)
+#    5. no BOOKING_LINK_SENT -> DO NOT SEND (never actually got a link)
+#    6. booked / indeterminate -> DO NOT SEND (the booked guard decides, via a
+#                               fresh three-source GHL check, because the send
+#                               is classified SendKind.NURTURE)
+#
+#  It never touches state["stage"]. If the lead replies afterwards,
+#  restore_stage_from_ghl() reads QUALIFIED / BOOKING_LINK_SENT and resumes at
+#  SEND_BOOKING, so qualification is never restarted.
+#
+#  Fires at most once per contact, ever. There is no second nudge and no retry.
+# ═════════════════════════════════════════════════════════════════════════
+
+@app.post("/webhook/booking-nudge")
+async def booking_nudge_webhook(request: Request):
+    """Called by the GHL booking-nudge workflow ~24h after the link is sent."""
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            _raw = (await request.body()).decode("utf-8", errors="replace")
+            body = dict(parse_qs(_raw)) if _raw else {}
+        if not isinstance(body, dict):
+            body = {}
+
+        def _pick(*keys) -> str:
+            for k in keys:
+                v = body.get(k)
+                if isinstance(v, list):
+                    v = v[0] if v else None
+                if v not in (None, "", []):
+                    return str(v).strip()
+            return ""
+
+        contact_id = _pick("contactId", "contact_id", "contact", "id")
+        phone      = _pick("phone", "phone_number", "phoneNumber")
+        # Optional inline cancel, so a workflow can suppress without a tag.
+        _cancel    = str(_pick("cancel", "cancelled", "manual")).lower() in ("1", "true", "yes")
+
+        if not contact_id:
+            ev("NUDGE_MALFORMED", "", keys=sorted(body.keys())[:12],
+               note="no contact id — ignored, nothing changed")
+            return JSONResponse({"status": "success", "sent": False,
+                                 "reason": "no_contact_id"})
+
+        def _skip(reason: str, **extra):
+            ev("NUDGE_SUPPRESSED", contact_id, reason=reason, **extra)
+            return JSONResponse({"status": "success", "sent": False, "reason": reason,
+                                 "contact_id": contact_id})
+
+        # ── Fresh authoritative tags. Never the webhook payload. ──────
+        _tags_ok, _tags = await _fetch_contact_tags_ex(contact_id)
+        if not _tags_ok:
+            return _skip("tag_lookup_failed")          # fail safe
+        if has_tag(_tags, TAG_DNC):
+            return _skip("dnc")
+        if has_tag(_tags, TAG_NUDGE_SENT):
+            return _skip("already_nudged")
+        # A human has this conversation. Two follow-ups in a day reads as
+        # pestering, and the manual one is better than anything automated.
+        if has_tag(_tags, TAG_NUDGE_CANCELLED):
+            return _skip("manually_handled")
+        if not any(has_tag(_tags, t) for t in _TAGS_QUALIFIED):
+            return _skip("no_booking_link_sent")
+        if has_tag(_tags, TAG_DISQUALIFIED):
+            return _skip("disqualified")
+
+        if _cancel:
+            return _skip("manually_handled_payload")
+
+        state = get_state(contact_id)
+        if state.get("stage") == Stage.DNC:
+            return _skip("dnc_state")
+
+        _to = phone or state.get("phone", "")
+        ev("NUDGE_ATTEMPT", contact_id, phone=_to, stage=str(state.get("stage")))
+
+        # SendKind.NURTURE is guarded, so send_sms_via_ghl() runs the fresh
+        # three-source booked check (tags + opportunity stage + appointments)
+        # and suppresses on booked OR on any indeterminate result.
+        _send = await send_sms_via_ghl(
+            contact_id, build_booking_nudge(), to_number=_to,
+            kind=SendKind.NURTURE,
+        )
+
+        if _send.get("status") not in _STATUS_ADVANCES_STATE:
+            ev("NUDGE_NOT_SENT", contact_id, status=_send.get("status"),
+               reason=_send.get("reason") or _send.get("why") or "(none)")
+            return JSONResponse({"status": "success", "sent": False,
+                                 "reason": _send.get("reason") or "booked_guard",
+                                 "why": _send.get("why"),
+                                 "contact_id": contact_id})
+
+        _record_send_result(contact_id, state, _send)
+        # Durable one-shot marker, written only after acceptance.
+        try:
+            await add_ghl_tags(contact_id, [TAG_NUDGE_SENT])
+        except Exception as _t_err:
+            log.warning(f"[{contact_id}] nudge tag write failed (non-fatal): {_t_err}")
+
+        ev("NUDGE_SENT", contact_id, message_id=_send.get("message_id") or "(none)",
+           status=_send.get("status"))
+        return JSONResponse({"status": "success", "sent": True,
+                             "contact_id": contact_id,
+                             "sms_status": _send.get("status"),
+                             "message_id": _send.get("message_id")})
+
+    except Exception as err:
+        log.error(f"booking-nudge fatal: {err}")
+        print(f"[ERROR] booking-nudge FATAL:\n{traceback.format_exc()}")
+        return JSONResponse({"status": "success", "error_logged": True})
+
 
 @app.post("/webhook/message-status")
 async def message_status_webhook(request: Request):
