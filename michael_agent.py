@@ -502,7 +502,7 @@ from enum import Enum
 from pathlib import Path
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
-from typing import Optional
+from typing import NamedTuple, Optional
 import asyncio
 from urllib.parse import parse_qs
 
@@ -920,6 +920,18 @@ def get_state(contact_id: str) -> dict:
             "homeowner"             : None,     # None | "yes" | "no"
             "location_confirmed"    : False,    # True once service area confirmed
             "monthly_bill"          : "",       # e.g. "$150/month" once parsed
+            # ── [BUNDLE-1] Qualification record ──────────────────────────
+            # The three criteria the offer actually depends on, each a real
+            # tri-state so "not asked yet" is never mistaken for "no". These
+            # are the source of truth; the three fields above are kept in
+            # sync with them by sync_qualification_fields() because tags,
+            # stage restore and the prompt still read the originals.
+            "q_homeowner"           : "unknown",   # yes | no | unknown
+            "q_utility"             : "unknown",   # ameren | other | unknown
+            "q_bill_100_plus"       : "unknown",   # yes | no | unknown
+            # True once the bundled criteria message has gone out, so the
+            # agent does not send the same framing twice.
+            "bundled_offer_sent"    : False,
             # Booking / appointment state
             "qualified"              : False,
             "booking_detected"       : False,
@@ -963,7 +975,11 @@ def get_state(contact_id: str) -> dict:
             # Used to disambiguate brief yes/no replies and detect duplicate sends.
             # Values: "utility" | "ownership" | "bill" | "send_booking" | "none"
             "pending_question"        : "none",
+            # [CONVERT-1] What we said last, and how it was classified.
+            # last_outbound_text may be recovered from GHL when the message
+            # was sent by a nurture workflow rather than by this service.
             "last_outbound_intent"    : "none",
+            "last_outbound_text"      : "",
             # ── [DELIVERY] Outbound delivery bookkeeping ──────────────────
             # last_send_status  — SendStatus of the most recent attempt.
             # last_message_id   — GHL message id, for correlating a future
@@ -1001,8 +1017,10 @@ def parse_qualification_tags(tags: list) -> dict:
             result["homeowner"] = "no"
         elif t == "ameren-confirmed":
             result["location_confirmed"] = True
+            result["utility"] = UTIL_AMEREN
         elif t in ("ameren-illinois", "out-of-area"):
             result["out_of_area"] = True
+            result["utility"] = UTIL_OTHER
         elif t.startswith("bill-"):
             result["bill_range"] = t[5:].replace("-", "–")
         elif t.startswith("roof-"):
@@ -2126,7 +2144,8 @@ _BILL_AMOUNT = re.compile(
 )
 
 
-def _detect_homeowner(text: str, stage: Stage, location_confirmed: bool = False) -> Optional[str]:
+def _detect_homeowner(text: str, stage: Stage, location_confirmed: bool = False,
+                      previous_outbound_type: str = "unknown") -> Optional[str]:
     """
     Return 'yes', 'no', or None.
     Explicit ownership patterns always match regardless of stage.
@@ -2150,7 +2169,15 @@ def _detect_homeowner(text: str, stage: Stage, location_confirmed: bool = False)
     # so brief "yes" is a utility confirmation — not homeowner — in that reply.
     # Requiring location_confirmed=True prevents a single "yes" from simultaneously
     # setting both utility and ownership when they arrive in separate messages.
-    if stage == Stage.ASK_OWNERSHIP and location_confirmed:
+    # [BUNDLE-1] Stage is a weaker signal than the message actually sent. When
+    # the previous outbound is known and was NOT about ownership, a bare "yes"
+    # cannot be an ownership answer however the stage happens to be labelled —
+    # stale stages are common after a restart, and inventing a fact here is
+    # exactly the accident the qualification record exists to prevent.
+    _asked_ownership = previous_outbound_type in (
+        OUT_UNKNOWN, OUT_OWNERSHIP_Q, OUT_BUNDLED_QUAL,
+    )
+    if stage == Stage.ASK_OWNERSHIP and location_confirmed and _asked_ownership:
         if _BRIEF_YES.match(text.strip()):
             return "yes"
         if _BRIEF_NO.match(text.strip()):
@@ -2158,7 +2185,8 @@ def _detect_homeowner(text: str, stage: Stage, location_confirmed: bool = False)
     return None
 
 
-def _detect_location_confirmed(text: str, location_confirmed_already: bool, homeowner_set: bool) -> bool:
+def _detect_location_confirmed(text: str, location_confirmed_already: bool, homeowner_set: bool,
+                               previous_outbound_type: str = "unknown") -> bool:
     """
     Return True if this inbound text confirms service area (St. Louis Missouri-side, Ameren Missouri).
 
@@ -2174,8 +2202,12 @@ def _detect_location_confirmed(text: str, location_confirmed_already: bool, home
         return False   # already set — nothing to do
     if _LOC_YES_EXPLICIT.search(text):
         return True
-    # Brief 'yes' when on the very first question (location not confirmed, no owner answer yet)
-    if not homeowner_set and _BRIEF_YES.match(text.strip()):
+    # Brief 'yes' when on the very first question (location not confirmed, no
+    # owner answer yet) AND the last thing we sent was not some other question.
+    _asked_area = previous_outbound_type in (
+        OUT_UNKNOWN, OUT_UTILITY_Q, OUT_BUNDLED_QUAL,
+    )
+    if not homeowner_set and _asked_area and _BRIEF_YES.match(text.strip()):
         return True
     return False
 
@@ -2195,7 +2227,8 @@ def _detect_bill_amount(text: str) -> str:
     return ""
 
 
-def update_state_from_inbound(state: dict, inbound_text: str) -> None:
+def update_state_from_inbound(state: dict, inbound_text: str,
+                              previous_outbound_type: str = "unknown") -> None:
     """
     [ADAPT-2] Parse the lead's inbound message and update state fields in place.
     Called BEFORE Claude so build_system_prompt() sees the latest signals.
@@ -2211,7 +2244,8 @@ def update_state_from_inbound(state: dict, inbound_text: str) -> None:
     _loc_conf_before = loc_conf
 
     # Service area — parse first so location_confirmed is current for logging.
-    if _detect_location_confirmed(inbound_text, loc_conf, homeowner_set=homeown is not None):
+    if _detect_location_confirmed(inbound_text, loc_conf, homeowner_set=homeown is not None,
+                                  previous_outbound_type=previous_outbound_type):
         state["location_confirmed"] = True
         loc_conf = True
         print(f"[STATE] 📍 location_confirmed=True | FIELD_UPDATED=location_confirmed")
@@ -2220,7 +2254,8 @@ def update_state_from_inbound(state: dict, inbound_text: str) -> None:
     # Pass PRE-update loc_conf: if "yes" just confirmed utility this pass, it cannot
     # also confirm homeownership — those are separate questions requiring separate replies.
     if state.get("homeowner") is None:
-        detected = _detect_homeowner(inbound_text, stage, location_confirmed=_loc_conf_before)
+        detected = _detect_homeowner(inbound_text, stage, location_confirmed=_loc_conf_before,
+                                     previous_outbound_type=previous_outbound_type)
         if detected:
             state["homeowner"] = detected
             print(f"[STATE] 🏠 homeowner={detected!r} | FIELD_UPDATED=homeowner")
@@ -2350,6 +2385,1086 @@ def build_process_answer(state: dict) -> str:
 
 
 # ─────────────────────────────────────────────
+#  QUALIFICATION RECORD  [BUNDLE-1]
+#
+#  WHY THIS EXISTS
+#    Qualification used to be a script: one question per SMS, in a fixed
+#    order, driven by Stage. That reads like a form, not a person, and it
+#    costs conversions — three round trips before anyone sees a calendar.
+#
+#    It also could not represent what it needed to. Of the three original
+#    fields only `homeowner` was tri-state; `location_confirmed` was a bool
+#    that conflated "no" with "not asked yet" AND conflated service area with
+#    utility provider, and the $100 threshold existed only as prose inside
+#    the prompt, never as a field.
+#
+#  THE MODEL
+#    Three independent facts, each genuinely tri-state, each inferable from
+#    natural language in any order, from any message:
+#
+#      q_homeowner      yes | no | unknown
+#      q_utility        ameren | other | unknown
+#      q_bill_100_plus  yes | no | unknown
+#
+#    The agent asks only for what is missing. When two or more are unknown it
+#    states all the conditions in one conversational line and lets the
+#    homeowner confirm them together.
+#
+#  THE AMBIGUITY RULE — the important one
+#    A bare "yes" confirms ALL THREE facts only when the message it answers
+#    explicitly bundled all three. A "yes" to "Are you with Ameren?" confirms
+#    Ameren and nothing else, ever. That distinction is enforced in exactly
+#    one place — extract_qualification_facts() — and is what stops a bundled
+#    convenience from becoming a silent assumption.
+#
+#  LEGACY FIELDS
+#    homeowner / location_confirmed / monthly_bill are still written and read
+#    by tag resolution, stage restore, the booked guard and the prompt. They
+#    are kept in sync with the record in both directions by
+#    sync_qualification_fields(), so nothing downstream changed.
+# ─────────────────────────────────────────────
+
+QUAL_UNKNOWN = "unknown"
+QUAL_YES     = "yes"
+QUAL_NO      = "no"
+UTIL_AMEREN  = "ameren"
+UTIL_OTHER   = "other"
+
+# The threshold the offer is built around. Below it, the math does not work.
+BILL_THRESHOLD = 100
+
+VERDICT_QUALIFIED    = "qualified"
+VERDICT_DISQUALIFIED = "disqualified"
+VERDICT_INCOMPLETE   = "incomplete"
+
+# Field keys, used in logs and in the "what is still missing" list.
+Q_HOMEOWNER = "homeowner"
+Q_UTILITY   = "utility"
+Q_BILL      = "bill_100_plus"
+
+
+# ── Ownership, stated explicitly ─────────────────────────────────────────
+_OWN_YES_RE = re.compile(
+    r"\b(i\s+own|we\s+own|i'?m\s+the\s+owner|i\s+am\s+the\s+owner"
+    r"|own\s+(?:it|the\s+(?:home|house|place|property))"
+    r"|homeowner|home\s?owner|owner\s+here"
+    r"|it'?s\s+my\s+(?:home|house|place)|my\s+own\s+home"
+    r"|bought\s+(?:it|the\s+(?:home|house|place)))\b",
+    re.IGNORECASE,
+)
+_OWN_NO_RE = re.compile(
+    r"\b(i\s+rent\b|we\s+rent\b|i'?m\s+renting|i\s+am\s+renting|renting\b|renter\b"
+    r"|not\s+the\s+owner|don'?t\s+own|do\s+not\s+own|landlord|tenant"
+    r"|leasing|i\s+lease\b)\b",
+    re.IGNORECASE,
+)
+
+# ── Utility, stated explicitly ───────────────────────────────────────────
+# Ameren Missouri is the only qualifying provider. Ameren ILLINOIS is a
+# different utility on the other side of the river and does NOT qualify,
+# so it is matched before the bare "ameren" test.
+_UTIL_AMEREN_IL_RE = re.compile(r"ameren\s+(?:il\b|illinois)", re.IGNORECASE)
+_UTIL_AMEREN_RE    = re.compile(r"\bameren\b", re.IGNORECASE)
+
+# Named non-Ameren providers seen around the St. Louis metro, plus the
+# generic co-op phrasing. Any of these disqualifies on utility.
+_UTIL_OTHER_RE = re.compile(
+    r"\b(cuivre\s*river|evergy|spire|citizens\s+electric|rural\s+electric"
+    r"|electric\s+co-?op|co-?operative|kcp&?l|empire\s+district"
+    r"|missouri\s+rural|lacle?de)\b"
+    r"|\bnot\s+(?:with\s+|on\s+)?ameren\b"
+    r"|\bdon'?t\s+have\s+ameren\b",
+    re.IGNORECASE,
+)
+
+# ── Bill amount and threshold ────────────────────────────────────────────
+# _BILL_AMOUNT (above) needs a "$" or an explicit "a month". People also
+# write "my bill is around 180", so a bare number is accepted when the
+# message is clearly about the bill.
+_BILL_CONTEXT_RE = re.compile(r"\b(bill|electric|power|ameren|pay|spend)\b", re.IGNORECASE)
+_BILL_BARE_NUM_RE = re.compile(r"\b(\d{2,4})\b")
+
+_BILL_OVER_RE = re.compile(
+    r"\b(over|above|more\s+than|north\s+of|at\s+least|upwards\s+of|higher\s+than)\b"
+    r"[^\d]{0,12}\$?\s*(\d{2,4})",
+    re.IGNORECASE,
+)
+_BILL_UNDER_RE = re.compile(
+    r"\b(under|below|less\s+than|lower\s+than|no\s+more\s+than)\b"
+    r"[^\d]{0,12}\$?\s*(\d{2,4})",
+    re.IGNORECASE,
+)
+# Vague amounts people actually use. Only mapped when clearly about the bill.
+_BILL_VAGUE_HIGH_RE = re.compile(
+    r"\b(couple\s+hundred|few\s+hundred|two\s+hundred|three\s+hundred"
+    r"|hundreds|way\s+more\s+than\s+that)\b",
+    re.IGNORECASE,
+)
+
+
+def _detect_ownership(text: str) -> Optional[str]:
+    """QUAL_YES / QUAL_NO from an explicit statement, else None."""
+    t = text or ""
+    if _OWN_NO_RE.search(t):
+        return QUAL_NO
+    if _OWN_YES_RE.search(t):
+        return QUAL_YES
+    return None
+
+
+def _detect_utility(text: str) -> Optional[str]:
+    """UTIL_AMEREN / UTIL_OTHER from an explicit statement, else None."""
+    t = text or ""
+    if _UTIL_AMEREN_IL_RE.search(t) or _UTIL_OTHER_RE.search(t):
+        return UTIL_OTHER
+    if _UTIL_AMEREN_RE.search(t):
+        return UTIL_AMEREN
+    return None
+
+
+def _detect_bill_threshold(text: str) -> tuple[Optional[str], str]:
+    """
+    (verdict, amount_string) where verdict is QUAL_YES / QUAL_NO / None and
+    amount_string is "$NNN/month" when a concrete figure was given, else "".
+    """
+    t = text or ""
+
+    m = _BILL_OVER_RE.search(t)
+    if m:
+        try:
+            val = int(m.group(2))
+            return (QUAL_YES if val >= BILL_THRESHOLD else None), ""
+        except ValueError:
+            pass
+
+    m = _BILL_UNDER_RE.search(t)
+    if m:
+        try:
+            val = int(m.group(2))
+            return (QUAL_NO if val <= BILL_THRESHOLD else None), ""
+        except ValueError:
+            pass
+
+    amount = _detect_bill_amount(t)
+    if not amount and _BILL_CONTEXT_RE.search(t):
+        for raw in _BILL_BARE_NUM_RE.findall(t):
+            try:
+                val = int(raw)
+            except ValueError:
+                continue
+            if 10 <= val <= 2000:
+                amount = f"${val}/month"
+                break
+
+    if amount:
+        try:
+            val = int(amount.lstrip("$").split("/")[0])
+            return (QUAL_YES if val >= BILL_THRESHOLD else QUAL_NO), amount
+        except ValueError:
+            return None, ""
+
+    if _BILL_VAGUE_HIGH_RE.search(t) and _BILL_CONTEXT_RE.search(t):
+        return QUAL_YES, ""
+
+    return None, ""
+
+
+# ── Bundled-criteria detection on the OUTBOUND side ──────────────────────
+# A message is a bundled qualification offer when it names at least two of
+# the three criteria AND frames them conditionally. Both halves are required:
+# "About what does the Ameren bill usually run you?" names two criteria but
+# asks for one of them, and must stay a bill question.
+
+_CRIT_OWN_MENTION_RE = re.compile(
+    r"\b(own\s+(?:the|your|it)|homeowner|home\s?owner|you'?re\s+the\s+owner)\b",
+    re.IGNORECASE,
+)
+_CRIT_UTIL_MENTION_RE = re.compile(r"\bameren\b", re.IGNORECASE)
+_CRIT_BILL_MENTION_RE = re.compile(
+    r"(\$\s*\d{2,4}|\b\d{2,4}\s*(?:\+|or\s+more|a\s+month|/\s*month|per\s+month)"
+    r"|\bbill\b|\bspend(?:ing)?\b|\bnorth\s+of\b)",
+    re.IGNORECASE,
+)
+_CONDITIONAL_FRAME_RE = re.compile(
+    r"\b(if|assuming|as\s+long\s+as|so\s+long\s+as|provided\s+that|whenever)\b",
+    re.IGNORECASE,
+)
+
+
+def bundled_criteria_mentioned(text: str) -> int:
+    """How many of the three criteria this message names (0-3)."""
+    t = text or ""
+    return sum((
+        bool(_CRIT_OWN_MENTION_RE.search(t)),
+        bool(_CRIT_UTIL_MENTION_RE.search(t)),
+        bool(_CRIT_BILL_MENTION_RE.search(t)),
+    ))
+
+
+def is_bundled_qualification_message(text: str) -> bool:
+    """True when an outbound message states the criteria together, conditionally."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    return bundled_criteria_mentioned(t) >= 2 and bool(_CONDITIONAL_FRAME_RE.search(t))
+
+
+# ── Blanket confirmations of a bundled offer ─────────────────────────────
+# "That's me" and "all of those apply" are affirmatives that carry no
+# affirmative token, so is_affirmative_reply() does not see them. They are
+# only ever read as a blanket yes when answering a bundled offer.
+_BLANKET_YES_RE = re.compile(
+    r"^\s*(?:yes[,\s]+)?"
+    r"(that'?s\s+me|that\s+is\s+me|thats\s+me"
+    r"|all\s+(?:of\s+)?(?:those|that|three)\s+(?:apply|applies|are\s+true|fit)"
+    r"|all\s+(?:of\s+)?that\s+applies"
+    r"|that\s+all\s+applies|all\s+true|yes\s+to\s+all"
+    r"|(?:that|those)\s+(?:all\s+)?(?:apply|applies)\s+to\s+me"
+    r"|applies\s+to\s+me)"
+    r"[\s.!]*$",
+    re.IGNORECASE,
+)
+
+
+def is_blanket_confirmation(text: str) -> bool:
+    """True for 'that's me' / 'all of those apply' style whole-bundle yeses."""
+    t = (text or "").strip()
+    if not t or len(t) > 60:
+        return False
+    return bool(_BLANKET_YES_RE.match(t))
+
+
+def extract_qualification_facts(text: str,
+                                previous_outbound_type: str = "unknown") -> dict:
+    """
+    Facts this inbound message establishes, as {field: value}. Only fields the
+    message genuinely settles appear; everything else is simply absent.
+
+    THE AMBIGUITY RULE lives here and nowhere else:
+
+      • A bare affirmative after a BUNDLED offer confirms all three, because
+        all three is exactly what was put to them.
+      • A bare affirmative after a single question confirms that one fact.
+      • A bare affirmative after a conversion invitation confirms NOTHING
+        factual — it signals interest, which is handled separately. Booking
+        someone is not the same as claiming to know they own their home.
+      • Anything stated explicitly OVERRIDES the blanket yes. "Yes, but I
+        have Cuivre River" is a yes to the invitation and a no on utility.
+    """
+    t = (text or "").strip()
+    facts: dict = {}
+    if not t:
+        return facts
+
+    blanket = is_blanket_confirmation(t)
+    bare    = is_affirmative_reply(t) or blanket
+
+    if bare:
+        if previous_outbound_type == OUT_BUNDLED_QUAL:
+            facts[Q_HOMEOWNER] = QUAL_YES
+            facts[Q_UTILITY]   = UTIL_AMEREN
+            facts[Q_BILL]      = QUAL_YES
+            facts["_source"]   = "bundled_affirmative"
+        elif previous_outbound_type == OUT_OWNERSHIP_Q:
+            facts[Q_HOMEOWNER] = QUAL_YES
+            facts["_source"]   = "ownership_affirmative"
+        elif previous_outbound_type == OUT_UTILITY_Q:
+            facts[Q_UTILITY]   = UTIL_AMEREN
+            facts["_source"]   = "utility_affirmative"
+        # A bare "yes" to "what does the bill run?" settles nothing, and a
+        # bare "yes" to a conversion invitation is interest, not a fact.
+
+    # Explicit statements always win over an inferred blanket yes.
+    own = _detect_ownership(t)
+    if own:
+        facts[Q_HOMEOWNER] = own
+        facts["_source"]   = "explicit"
+
+    util = _detect_utility(t)
+    if util:
+        facts[Q_UTILITY]   = util
+        facts["_source"]   = "explicit"
+
+    bill_verdict, bill_amount = _detect_bill_threshold(t)
+    if bill_verdict:
+        facts[Q_BILL]      = bill_verdict
+        facts["_source"]   = "explicit"
+        if bill_amount:
+            facts["bill_amount"] = bill_amount
+
+    return facts
+
+
+def apply_qualification_facts(state: dict, facts: dict, contact_id: str = "") -> list[str]:
+    """
+    Write established facts into the record. Returns the field names changed.
+
+    Fill-and-correct, not blind overwrite: a field moves off "unknown"
+    freely, but an existing answer is only replaced by an EXPLICIT one — a
+    blanket bundled yes can never overturn something the homeowner actually
+    told us.
+    """
+    changed: list[str] = []
+    explicit = facts.get("_source") == "explicit"
+
+    for key, field in ((Q_HOMEOWNER, "q_homeowner"),
+                       (Q_UTILITY,   "q_utility"),
+                       (Q_BILL,      "q_bill_100_plus")):
+        value = facts.get(key)
+        if not value:
+            continue
+        current = state.get(field, QUAL_UNKNOWN) or QUAL_UNKNOWN
+        if current == value:
+            continue
+        if current != QUAL_UNKNOWN and not explicit:
+            continue
+        state[field] = value
+        changed.append(field)
+        print(f"[QUAL] {field}={value!r} | FIELD_UPDATED={field} | src={facts.get('_source', '?')}")
+
+    amount = facts.get("bill_amount")
+    if amount and not state.get("monthly_bill"):
+        state["monthly_bill"] = amount
+        changed.append("monthly_bill")
+        print(f"[QUAL] monthly_bill={amount!r} | FIELD_UPDATED=monthly_bill")
+
+    if changed and contact_id:
+        ev("QUALIFICATION_UPDATED", contact_id,
+           fields=",".join(changed), source=facts.get("_source", "?"),
+           homeowner=state.get("q_homeowner"), utility=state.get("q_utility"),
+           bill_100_plus=state.get("q_bill_100_plus"))
+    return changed
+
+
+def sync_qualification_fields(state: dict) -> None:
+    """
+    Keep the record and the original fields telling the same story.
+
+    NEW → LEGACY is unconditional: everything downstream (tags, stage
+    restore, prompt memory) still reads the originals.
+
+    LEGACY → NEW is deliberately partial. `homeowner` and `monthly_bill` mean
+    the same thing in both models and map straight across. `location_confirmed`
+    does NOT: it is set to True at form submission because an address is in
+    the service area, which says nothing about who supplies the electricity.
+    Mapping it to q_utility="ameren" would manufacture a confirmation nobody
+    gave — precisely the assumption this record exists to prevent.
+    """
+    # ── legacy → record ──
+    if state.get("q_homeowner", QUAL_UNKNOWN) == QUAL_UNKNOWN and state.get("homeowner"):
+        state["q_homeowner"] = QUAL_YES if state["homeowner"] == "yes" else QUAL_NO
+
+    if state.get("q_bill_100_plus", QUAL_UNKNOWN) == QUAL_UNKNOWN and state.get("monthly_bill"):
+        try:
+            val = int(str(state["monthly_bill"]).lstrip("$").split("/")[0])
+            state["q_bill_100_plus"] = QUAL_YES if val >= BILL_THRESHOLD else QUAL_NO
+        except ValueError:
+            pass
+
+    # A booked contact, or one explicitly flagged qualified, demonstrably
+    # answered all three at some point, so the record must not re-open them.
+    #
+    # Stage SEND_BOOKING alone is NOT such evidence any more: the conversion
+    # path reaches it whenever a high-intent lead gets the link, which now
+    # happens before the criteria are known. Backfilling from the stage would
+    # erase the very unknowns that put the conditions in the message.
+    if state.get("qualified") or state.get("stage") == Stage.BOOKED:
+        for field, value in (("q_homeowner", QUAL_YES),
+                             ("q_utility", UTIL_AMEREN),
+                             ("q_bill_100_plus", QUAL_YES)):
+            if state.get(field, QUAL_UNKNOWN) == QUAL_UNKNOWN:
+                state[field] = value
+
+    # ── record → legacy ──
+    if state.get("q_homeowner") in (QUAL_YES, QUAL_NO) and state.get("homeowner") is None:
+        state["homeowner"] = state["q_homeowner"]
+
+    # Ameren Missouri is in the service area by definition, so this direction
+    # is sound where the reverse is not.
+    if state.get("q_utility") == UTIL_AMEREN:
+        state["location_confirmed"] = True
+
+
+def qualification_verdict(state: dict) -> tuple[str, list[str]]:
+    """
+    (verdict, missing_fields).
+
+      VERDICT_DISQUALIFIED — any one criterion has failed. Decisive: a renter
+                             is a renter regardless of the other two.
+      VERDICT_QUALIFIED    — all three confirmed.
+      VERDICT_INCOMPLETE   — nothing failed, something is still unknown.
+    """
+    home = state.get("q_homeowner", QUAL_UNKNOWN) or QUAL_UNKNOWN
+    util = state.get("q_utility", QUAL_UNKNOWN) or QUAL_UNKNOWN
+    bill = state.get("q_bill_100_plus", QUAL_UNKNOWN) or QUAL_UNKNOWN
+
+    if home == QUAL_NO or util == UTIL_OTHER or bill == QUAL_NO:
+        return VERDICT_DISQUALIFIED, []
+
+    missing = [
+        name for name, value, good in (
+            (Q_HOMEOWNER, home, QUAL_YES),
+            (Q_UTILITY,   util, UTIL_AMEREN),
+            (Q_BILL,      bill, QUAL_YES),
+        ) if value != good
+    ]
+    return (VERDICT_INCOMPLETE if missing else VERDICT_QUALIFIED), missing
+
+
+def qualification_summary(state: dict) -> str:
+    """One greppable string for the logs."""
+    verdict, missing = qualification_verdict(state)
+    return (
+        f"homeowner={state.get('q_homeowner', QUAL_UNKNOWN)} "
+        f"utility={state.get('q_utility', QUAL_UNKNOWN)} "
+        f"bill_100_plus={state.get('q_bill_100_plus', QUAL_UNKNOWN)} "
+        f"verdict={verdict}"
+        + (f" missing={','.join(missing)}" if missing else "")
+    )
+
+
+# How each missing fact should be asked for, when only one is left. The
+# wording is guidance for Claude, not a template — the agent varies it.
+_MISSING_FIELD_GUIDANCE = {
+    Q_UTILITY:   ("utility",   "confirm they're with Ameren Missouri for electric — "
+                               "a short confirming question, e.g. \"And you're with Ameren for electric, right?\""),
+    Q_HOMEOWNER: ("ownership", "confirm they own the home. Use the phrasing \"Are you the homeowner?\" — "
+                               "the \"do you own\" variants get filtered by carriers (error 30007)."),
+    Q_BILL:      ("bill",      "ask roughly what the Ameren bill runs each month. Open-ended, no brackets, "
+                               "a ballpark is fine."),
+}
+
+
+# ─────────────────────────────────────────────
+#  CONVERSION INTENT ENGINE  [CONVERT-1]
+#
+#  WHY THIS EXISTS
+#    A lead who ignored four nurture texts finally replied "Yes please" to
+#    "Did you still want me to put together the numbers for your home, or
+#    should I close this out?" — and was asked "Are you the homeowner?".
+#
+#    Three causes, all addressed here:
+#      1. The nurture text was sent by a GHL workflow, so state["messages"]
+#         had no record of it. The agent could not see what was being
+#         answered.  → prior_outbound is resolved from local history first
+#         and from GHL second (fetch_last_outbound_message).
+#      2. "Yes please" failed the anchored _BRIEF_YES regex, so nothing was
+#         learned from the reply at all.  → is_affirmative_reply() accepts
+#         the natural range of affirmatives.
+#      3. state["pending_question"] was written every turn and read nowhere.
+#         → classify_outbound_intent() derives the same fact from the actual
+#         previous outbound TEXT, which survives restarts and also covers
+#         messages this service never sent.
+#
+#  THE RULE
+#    A "yes" means whatever the previous outbound message asked. Yes to a
+#    conversion invitation is permission to book. Yes to "are you on Ameren?"
+#    is a qualification answer. The two must never be confused, in either
+#    direction. Everything below exists to tell them apart.
+#
+#  WHAT THIS DELIBERATELY DOES NOT DO
+#    It never fires for a booked, DNC, disqualified or rate-limited contact.
+#    It is positioned AFTER every hard stop in michael_agent(), so those
+#    guards are unreachable from here by construction.
+# ─────────────────────────────────────────────
+
+# Outbound message classes. The value is what appears in the logs as
+# previous_outbound_type=… so it is greppable in Render.
+OUT_BOOKING_PITCH  = "booking_pitch"
+# [BUNDLE-1] A message that states the qualification criteria together and
+# conditionally. A bare "yes" to one of these confirms ALL of them — which
+# is true of no other outbound class, so it is kept distinct.
+OUT_BUNDLED_QUAL   = "bundled_qualification"
+OUT_CONVERSION_INV = "conversion_invitation"
+OUT_OWNERSHIP_Q    = "ownership_question"
+OUT_UTILITY_Q      = "utility_provider_question"
+OUT_BILL_Q         = "bill_amount_question"
+OUT_OTHER          = "other"
+OUT_UNKNOWN        = "unknown"
+
+# Inbound intent classes.
+IN_HIGH_INTENT     = "high_intent_affirmative"
+IN_BUNDLED_AFFIRM  = "bundled_qualification_affirmative"
+IN_SCHEDULING      = "explicit_scheduling_request"
+IN_QUAL_AFFIRM     = "qualification_affirmative"
+IN_AMBIG_AFFIRM    = "ambiguous_affirmative"
+IN_NONE            = "none"
+
+# Actions.
+ACT_SEND_BOOKING   = "send_booking_link"
+ACT_CONTINUE_QUAL  = "continue_qualification"
+ACT_ASK_MISSING    = "ask_missing_criterion"
+ACT_NO_OVERRIDE    = "no_override"
+
+
+# ── Previous-outbound classifiers ────────────────────────────────────────
+# Checked in the order used by classify_outbound_intent(). A booking pitch is
+# identified by the link itself; a conversion invitation by invitational
+# grammar ("want me to…", "should I…", "would you like to…"), which no
+# qualification question in this flow ever uses.
+
+_OUT_BOOKING_PITCH_RE = re.compile(
+    r"(leadconnectorhq\.com|get-solar-info"
+    r"|here'?s\s+the\s+calendar"
+    r"|pick\s+whatever\s+time"
+    r"|grab\s+(?:a|whatever)\s+(?:quick\s+)?time"
+    r"|calendar\s+link)",
+    re.IGNORECASE,
+)
+
+_OUT_CONVERSION_INV_RE = re.compile(
+    r"("
+    r"(?:did|do)\s+you\s+(?:still\s+)?want\s+(?:me\s+)?to"
+    r"|want\s+me\s+to\s+(?:put|pull|run|go\s+over|walk|show|send|get|look|take|set|check)"
+    r"|want\s+to\s+(?:see|know|go\s+over|take\s+a\s+look|find\s+out|grab|set|move)"
+    r"|would\s+you\s+like\s+(?:me\s+)?to"
+    r"|(?:should|shall|can|could)\s+(?:i|we)\s+"
+    r"(?:put|pull|run|go\s+over|send|show|take\s+a\s+look|set|get|close)"
+    r"|interested\s+in\s+(?:seeing|taking\s+a\s+look|going\s+over)"
+    r"|worth\s+(?:taking\s+)?a\s+look"
+    r"|should\s+i\s+close\s+(?:this|it)\s+out"
+    r"|what\s+your\s+home\s+(?:could|would|might)\s+qualify\s+for"
+    r"|could\s+qualify\s+for"
+    r")",
+    re.IGNORECASE,
+)
+
+_OUT_OWNERSHIP_Q_RE = re.compile(
+    r"(are\s+you\s+the\s+home\s?owner"
+    r"|do\s+you\s+own\s+(?:the|your)\s+(?:home|house|place|property)"
+    r"|own\s+the\s+(?:home|place)\s*\?"
+    r"|are\s+you\s+the\s+owner)",
+    re.IGNORECASE,
+)
+
+_OUT_UTILITY_Q_RE = re.compile(
+    r"(ameren"
+    r"|electric\s+(?:provider|company|utility)"
+    r"|who'?s\s+your\s+(?:electric|power|utility)"
+    r"|for\s+electric\s*\?)",
+    re.IGNORECASE,
+)
+
+_OUT_BILL_Q_RE = re.compile(
+    r"(bill\s+usually\s+run"
+    r"|what\s+does\s+the\s+.{0,20}bill"
+    r"|monthly\s+bill"
+    r"|electric\s+bill\s+run"
+    r"|average\s+bill"
+    r"|bill\s+run\s+you)",
+    re.IGNORECASE,
+)
+
+
+def classify_outbound_intent(text: str) -> str:
+    """
+    Classify the message WE sent last. This is the anchor for interpreting a
+    bare "yes" — the single most ambiguous thing a lead can send.
+
+    Order is deliberate. An invitation is recognised before any qualification
+    pattern because invitational grammar is unambiguous, while a qualification
+    question can legitimately mention the same nouns ("want me to go over the
+    numbers on your Ameren bill?" is an invitation, not a bill question).
+
+    Returns one of the OUT_* constants; OUT_UNKNOWN when there is no text to
+    classify, which is the honest answer after a restart with no GHL history.
+    """
+    t = (text or "").strip()
+    if not t:
+        return OUT_UNKNOWN
+    if _OUT_BOOKING_PITCH_RE.search(t):
+        return OUT_BOOKING_PITCH
+    # [BUNDLE-1] Checked before every question class. A bundled offer often
+    # also ends in an invitation ("...want me to put it together?"), and the
+    # bundled reading is strictly more informative: a yes carries the facts
+    # as well as the interest.
+    if is_bundled_qualification_message(t):
+        return OUT_BUNDLED_QUAL
+    if _OUT_CONVERSION_INV_RE.search(t):
+        return OUT_CONVERSION_INV
+    if _OUT_OWNERSHIP_Q_RE.search(t):
+        return OUT_OWNERSHIP_Q
+    if _OUT_UTILITY_Q_RE.search(t):
+        return OUT_UTILITY_Q
+    if _OUT_BILL_Q_RE.search(t):
+        return OUT_BILL_Q
+    return OUT_OTHER
+
+
+# ── Inbound affirmative detection ────────────────────────────────────────
+# Broader than _BRIEF_YES by design: _BRIEF_YES gates a qualification FACT
+# (homeowner yes/no) and is deliberately strict; this gates a CONVERSATIONAL
+# reading and has to cover how people actually reply to an invitation.
+#
+# A negation anywhere disqualifies the whole message. "Yes but I'm renting"
+# and "not right now" must never reach the booking path.
+
+_WHY_NOT_RE = re.compile(r"^\s*why\s+not[\s.!?]*$", re.IGNORECASE)
+
+_NEGATIVE_REPLY_RE = re.compile(
+    r"\b(no|nope|nah|not|dont|doesn'?t|never|stop|quit|cancel|unsubscribe"
+    r"|remove|later|busy|already\s+(?:have|got|booked)|pass|hold\s+off"
+    r"|wrong\s+number)\b|don't",
+    re.IGNORECASE,
+)
+
+_AFFIRM_TOKEN = (
+    r"(?:yes|yeah|yep|yup|ya|yea|yah|yes\s+sir|yes\s+ma'?am"
+    r"|sure|sure\s+thing|absolutely|definitely|certainly|of\s+course"
+    r"|ok|okay|k|kk|alright|all\s+right|correct|affirmative"
+    r"|please|pls|please\s+do|interested|i'?m\s+interested"
+    r"|sounds\s+good|sounds\s+great|sounds\s+like\s+a\s+plan"
+    r"|works\s+for\s+me|that\s+works|that'?d\s+be\s+great"
+    r"|i\s+do|i\s+am|i'?m\s+in|im\s+in|we\s+do|we\s+are"
+    r"|for\s+sure|why\s+not|go\s+ahead|do\s+it|send\s+it|send\s+it\s+over"
+    r"|send\s+them|send\s+me\s+it|let'?s\s+do\s+it|lets\s+do\s+it"
+    r"|let'?s\s+go|lets\s+go|sign\s+me\s+up|perfect|great|cool|awesome"
+    r"|100%)"
+)
+
+# The whole message must be affirmative tokens plus connective filler.
+_AFFIRMATIVE_ONLY_RE = re.compile(
+    rf"^\s*{_AFFIRM_TOKEN}"
+    rf"(?:[\s,.!\-]+(?:and|then|i\s+guess|thanks|thank\s+you|{_AFFIRM_TOKEN}))*"
+    rf"[\s,.!?]*$",
+    re.IGNORECASE,
+)
+
+
+def is_affirmative_reply(text: str) -> bool:
+    """
+    True when the entire inbound message is an affirmative and nothing else.
+
+    Whole-message matching, not substring: "yes" inside "yes but my roof is
+    shot" is a qualified answer that deserves a real reply, not a booking
+    link. Anything carrying a negation is rejected outright.
+    """
+    t = (text or "").strip()
+    if not t or len(t) > 60:
+        return False
+    # "why not" is an affirmative built out of a negation word. Checked before
+    # the negation filter because that filter would otherwise reject it.
+    if _WHY_NOT_RE.match(t):
+        return True
+    if _NEGATIVE_REPLY_RE.search(t):
+        return False
+    return bool(_AFFIRMATIVE_ONLY_RE.match(t))
+
+
+# ── Explicit call / scheduling requests ──────────────────────────────────
+# These are self-evident regardless of what we said last, so they outrank the
+# affirmative logic entirely. A lead who says "just call me" has already told
+# us the next step; asking a qualification question now is pure friction.
+
+_SCHEDULING_REQUEST_RE = re.compile(
+    r"("
+    r"call\s+me|can\s+you\s+call|could\s+you\s+call|give\s+me\s+a\s+call"
+    r"|call\s+back|callback|ring\s+me"
+    r"|i'?m\s+free|im\s+free|available\s+now|free\s+now"
+    r"|when\s+can\s+(?:we|you|i)\s+(?:talk|meet|chat|come)"
+    r"|let'?s\s+talk|lets\s+talk|let'?s\s+meet|lets\s+meet"
+    r"|send\s+(?:me\s+)?(?:your\s+|the\s+)?calendar|calendar\s+link"
+    r"|how\s+do\s+(?:i|we)\s+(?:schedule|book|set\s+(?:this|it)\s+up)"
+    r"|(?:schedule|book)\s+(?:me|a\s+time|an?\s+appointment|something)"
+    r"|set\s+up\s+a\s+time|grab\s+a\s+time|pick\s+a\s+time"
+    r"|when\s+are\s+you\s+(?:available|free)"
+    r"|what\s+times?\s+(?:do\s+you\s+have|are\s+(?:you\s+)?available|work)"
+    r"|come\s+(?:on\s+)?(?:by|out)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def is_explicit_scheduling_request(text: str) -> bool:
+    """True when the lead has asked to talk, be called, or be scheduled."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    return bool(_SCHEDULING_REQUEST_RE.search(t))
+
+
+class ConversionDecision(NamedTuple):
+    """
+    One routing verdict, described fully enough that its log line explains
+    itself without anyone reading this file.
+
+      intent                 — IN_* constant
+      previous_outbound_type — OUT_* constant
+      action                 — ACT_* constant
+      reason                 — short human string, for the log only
+      qualification_answer   — the fact this reply establishes, "" when none
+      missing_field          — with ACT_ASK_MISSING, the one criterion still
+                               open; the only thing the next message may ask
+    """
+    intent                 : str
+    previous_outbound_type : str
+    action                 : str
+    reason                 : str
+    qualification_answer   : str = ""
+    missing_field          : str = ""
+
+
+def last_outbound_message(state: dict) -> str:
+    """The most recent thing WE said, from local conversation memory."""
+    for msg in reversed(state.get("messages") or []):
+        if msg.get("role") == "assistant":
+            return str(msg.get("content") or "")
+    return ""
+
+
+def decide_conversion_action(state: dict,
+                             inbound_text: str,
+                             prior_outbound: str = "") -> ConversionDecision:
+    """
+    The conversion-first decision step. Pure: reads state, returns a verdict,
+    mutates nothing. Every branch is unit-tested.
+
+    Priority — compliance, the booked lockout and the daily limit are enforced
+    by michael_agent() BEFORE this function is called, so nothing here can
+    override them:
+
+      0. a failed criterion                   → never book, whatever they said
+      D. explicit call / scheduling request   → send booking link
+      E. bundled criteria all confirmed       → send booking link
+      E. bundled reply, one criterion open    → ask that one thing only
+      E. affirmative to a conversion invite   → send booking link
+      E. affirmative to a booking pitch       → send booking link
+      E. affirmative while already qualified  → send booking link
+      G. affirmative to a single question     → continue qualification
+      H. everything else                      → no override, normal flow
+    """
+    prev      = (prior_outbound or "").strip() or last_outbound_message(state)
+    prev_type = classify_outbound_intent(prev)
+    verdict, missing = qualification_verdict(state)
+
+    # ── 0: a criterion has failed ────────────────────────────────
+    # Decisive and checked first. A renter who says "yes please" is still a
+    # renter; enthusiasm is not a qualification. Claude handles the decline
+    # on the normal path, where the DISQUALIFY responses live.
+    if verdict == VERDICT_DISQUALIFIED:
+        return ConversionDecision(
+            IN_NONE, prev_type, ACT_NO_OVERRIDE,
+            f"criterion failed — {qualification_summary(state)}",
+        )
+
+    # ── D: explicit request to call or schedule ──────────────────
+    if is_explicit_scheduling_request(inbound_text):
+        return ConversionDecision(
+            IN_SCHEDULING, prev_type, ACT_SEND_BOOKING,
+            "lead explicitly asked to talk or schedule",
+        )
+
+    _facts       = extract_qualification_facts(inbound_text, prev_type)
+    _told_us     = bool({Q_HOMEOWNER, Q_UTILITY, Q_BILL} & set(_facts))
+    _affirmative = is_affirmative_reply(inbound_text) or is_blanket_confirmation(inbound_text)
+
+    # ── E: a reply to the bundled criteria ───────────────────────
+    # Checked before the bare-affirmative gate, because a bundled offer is
+    # often answered with facts rather than a yes — "I own it and my bill is
+    # around $180" is a complete answer and must not fall through.
+    if prev_type == OUT_BUNDLED_QUAL and (_affirmative or _told_us):
+        if verdict == VERDICT_QUALIFIED:
+            return ConversionDecision(
+                IN_BUNDLED_AFFIRM, prev_type, ACT_SEND_BOOKING,
+                "all three criteria confirmed by the bundled reply",
+            )
+        if len(missing) == 1:
+            return ConversionDecision(
+                IN_BUNDLED_AFFIRM, prev_type, ACT_ASK_MISSING,
+                f"bundled reply left one criterion open: {missing[0]}",
+                missing_field=missing[0],
+            )
+
+    if not _affirmative:
+        return ConversionDecision(
+            IN_NONE, prev_type, ACT_NO_OVERRIDE,
+            "inbound is not a bare affirmative",
+        )
+
+    # ── E: affirmative — its meaning is whatever we asked last ───
+    if prev_type == OUT_CONVERSION_INV:
+        return ConversionDecision(
+            IN_HIGH_INTENT, prev_type, ACT_SEND_BOOKING,
+            "affirmative to a conversion invitation",
+        )
+
+    if prev_type == OUT_BOOKING_PITCH:
+        return ConversionDecision(
+            IN_HIGH_INTENT, prev_type, ACT_SEND_BOOKING,
+            "affirmative after the booking link was already sent",
+        )
+
+    # ── E: the reply completed the record ───────────────────
+    # Checked before the single-question branches below. Answering the last
+    # open criterion IS the moment to book; falling through to "continue
+    # qualification" would ask a fourth question that does not exist.
+    if verdict == VERDICT_QUALIFIED:
+        return ConversionDecision(
+            IN_HIGH_INTENT, prev_type, ACT_SEND_BOOKING,
+            "affirmative completed the record — all three criteria confirmed",
+        )
+
+    # ── G: affirmative answering a qualification question ────────
+    if prev_type == OUT_OWNERSHIP_Q:
+        return ConversionDecision(
+            IN_QUAL_AFFIRM, prev_type, ACT_CONTINUE_QUAL,
+            "homeowner confirmed — continue the flow, do not restart it",
+            qualification_answer="ownership_yes",
+        )
+
+    if prev_type == OUT_UTILITY_Q:
+        return ConversionDecision(
+            IN_QUAL_AFFIRM, prev_type, ACT_CONTINUE_QUAL,
+            "utility/service area confirmed — continue qualification",
+            qualification_answer="utility_yes",
+        )
+
+    if prev_type == OUT_BILL_Q:
+        return ConversionDecision(
+            IN_QUAL_AFFIRM, prev_type, ACT_CONTINUE_QUAL,
+            "affirmative to the bill question — continue qualification",
+        )
+
+    # ── E (fallback): already qualified, so an affirmative can only
+    #    reasonably mean "yes, let's do this" ──────────────────────
+    if state.get("qualified") or state.get("stage") == Stage.SEND_BOOKING:
+        return ConversionDecision(
+            IN_HIGH_INTENT, prev_type, ACT_SEND_BOOKING,
+            "affirmative from an already-qualified lead",
+        )
+
+    # ── H: affirmative with no evidence of what it answers ───────
+    # Deliberately NOT treated as high intent. Guessing here is exactly how a
+    # lead who said yes to "are you on Ameren?" would get a booking link
+    # instead of the next qualification question.
+    return ConversionDecision(
+        IN_AMBIG_AFFIRM, prev_type, ACT_NO_OVERRIDE,
+        "affirmative but no conversion-invitation evidence — normal flow",
+    )
+
+
+# ── Conversion reply generation ──────────────────────────────────────────
+#
+# The lead-in is written by Claude so it can match the homeowner's register;
+# the URL is appended by code and never comes from the model, exactly as
+# build_booking_message() has always worked.
+
+_CONVERSION_FALLBACKS: tuple = (
+    "Yep, absolutely. Grab whatever time works best for you here and I'll have everything ready:",
+    "Absolutely. Easiest way is to grab a quick time that works for you and I'll put everything together beforehand:",
+    "For sure. Pick a time that works for you and I'll have it all ready to go:",
+)
+
+# [BUNDLE-2] How each unconfirmed criterion reads as a CONDITION rather than a
+# question. Conditions can travel in the same message as the link; questions
+# cannot, because a question has to be answered before anything else happens.
+_CRITERION_CLAUSE = {
+    Q_HOMEOWNER: "you own the home",
+    Q_UTILITY:   "you're on Ameren",
+    Q_BILL:      "the electric bill usually runs over $100 a month",
+}
+
+# Fixed order, so a two-criterion clause always reads the same way round.
+_CRITERION_ORDER = (Q_HOMEOWNER, Q_UTILITY, Q_BILL)
+
+
+def criteria_clause(missing: list[str]) -> str:
+    """'you own the home, you're on Ameren, and the bill usually runs over $100 a month'"""
+    parts = [_CRITERION_CLAUSE[k] for k in _CRITERION_ORDER if k in (missing or [])]
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0]
+    if len(parts) == 2:
+        return f"{parts[0]} and {parts[1]}"
+    return f"{parts[0]}, {parts[1]}, and {parts[2]}"
+
+
+# Used when the record is incomplete: the conditions and the link ride in the
+# SAME message, so the homeowner self-qualifies without losing a turn.
+_CONVERSION_FALLBACKS_WITH_CRITERIA: tuple = (
+    "Absolutely. If {clause}, I'd be glad to show you what a $0-down option could "
+    "look like and answer any questions. Grab whatever time works for you here:",
+    "For sure. As long as {clause}, I can put the numbers together for you — "
+    "pick a time that works and I'll have it ready:",
+    "Yep. Assuming {clause}, I can show you what this would actually look like. "
+    "Grab a time that suits you here:",
+)
+
+
+def _conversion_fallback_line(contact_id: str, inbound_text: str,
+                              missing: list | None = None) -> str:
+    """
+    Deterministic per contact+message, so one turn never rewrites itself.
+
+    When criteria are still unknown the fallback states them as conditions and
+    still carries the link — never a bare booking link with no context, and
+    never a qualification question that stalls the conversation.
+    """
+    seed = hashlib.sha1(f"{contact_id}|{inbound_text}".encode("utf-8")).digest()[0]
+    clause = criteria_clause(list(missing or []))
+    if clause:
+        template = _CONVERSION_FALLBACKS_WITH_CRITERIA[
+            seed % len(_CONVERSION_FALLBACKS_WITH_CRITERIA)
+        ]
+        return template.format(clause=clause)
+    return _CONVERSION_FALLBACKS[seed % len(_CONVERSION_FALLBACKS)]
+
+
+def build_conversion_prompt(state: dict, decision: ConversionDecision,
+                            prior_outbound: str = "") -> str:
+    """
+    A deliberately small prompt. Its only job is one short, human lead-in
+    line — no qualification, no URL, no pitch. Everything the qualification
+    prompt can do is unreachable from here.
+    """
+    prev  = (prior_outbound or "").strip() or last_outbound_message(state)
+    first = _resolve_first_name("", state.get("contact_name", ""))
+    _verdict, _missing = qualification_verdict(state)
+
+    if decision.intent == IN_SCHEDULING:
+        situation = (
+            "The homeowner just asked to talk, be called, or be scheduled. "
+            "Acknowledge briefly and point them at the calendar."
+        )
+    else:
+        situation = (
+            "The homeowner just said yes to your invitation to move forward. "
+            "They have given you permission — take it, immediately and without fuss."
+        )
+
+    # [BUNDLE-2] High intent with an incomplete record. The conditions and the
+    # link go out TOGETHER: asking the three questions first would burn three
+    # turns and the momentum that produced this reply, while a bare link would
+    # book someone who may not qualify. Stating them as conditions lets the
+    # homeowner self-qualify without being interrogated.
+    _confirmed_lines = []
+    if state.get("q_homeowner") == QUAL_YES:
+        _confirmed_lines.append("they own the home")
+    if state.get("q_utility") == UTIL_AMEREN:
+        _confirmed_lines.append("they're on Ameren")
+    if state.get("q_bill_100_plus") == QUAL_YES:
+        _confirmed_lines.append("their bill is over $100/month")
+
+    if _missing:
+        _clause = criteria_clause(_missing)
+        criteria_block = f"""
+QUALIFICATION — FOLD IT INTO THIS SAME MESSAGE
+Still unknown: {_clause}.
+{("Already confirmed (do NOT restate or re-ask): " + ", ".join(_confirmed_lines) + ".") if _confirmed_lines else ""}
+
+State the unknown ones as CONDITIONS in the same sentence, then point at the
+calendar. One message, conditions and invitation together.
+• Conditions, never questions. "If you own the home and you're on Ameren..."
+  — not "Are you the homeowner?".
+• Do NOT split them across messages and do NOT hold the link back. The link
+  goes out in THIS message regardless.
+• Never restate a criterion already confirmed above.
+• You may offer "$0-down" only as a possibility for those who qualify. Never
+  a promise, never a number, never "free".
+
+Good: "Absolutely. If {_clause}, I'd be glad to show you what a $0-down option could look like and answer any questions. You can grab a time that works for you here:"
+Good: "For sure — as long as {_clause}, I can put the numbers together. Pick whatever time suits you:"
+Bad:  "Are you the homeowner?"
+Bad:  "Great! Here's my calendar:"   (no conditions at all)
+"""
+    else:
+        criteria_block = """
+QUALIFICATION
+All three criteria are already confirmed. Do NOT restate them, do NOT attach
+conditions, and do NOT ask anything. Just move them to the calendar.
+"""
+
+    return f"""You are Michael, a solar advisor for STL Energy Advisors.
+
+{situation}
+
+The last message you sent was:
+  {prev or '(not available)'}
+
+The homeowner's reply is the next message.
+{criteria_block}
+WRITE THE MESSAGE BODY ONLY. The booking link is appended automatically right
+after your text — do NOT write a URL, and do NOT mention a link, a calendar
+page, or an address.
+
+RULES
+• Short. One sentence when everything is confirmed; two at most when you are
+  stating conditions. Never more than 45 words.
+• Match their register. A two-word reply earns a short reply back.
+• End with a colon if it reads naturally, since a link follows.
+• Do NOT use their name ({first or 'n/a'}) — you are mid-conversation.
+• Do NOT sell, justify, or explain the appointment. They already agreed.
+• Do NOT thank them, compliment them, or use exclamation marks.
+• No emojis. No "Great!", "Perfect!", "Awesome".
+• Never say "phone call" or "virtual" — the visit is in-home.
+• No control tags, no brackets.
+""".strip()
+
+
+# Anything URL-shaped must never survive from the model into the lead-in;
+# build_conversion_reply() appends the single authoritative link itself.
+_ANY_URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
+
+# A criterion put as a question rather than a condition. On the conversion
+# path this is always wrong — it stalls a lead who just said yes.
+_ASKS_A_CRITERION_RE = re.compile(
+    r"(are\s+you\s+the\s+home\s?owner|do\s+you\s+own\b|are\s+you\s+(?:on|with)\s+ameren"
+    r"|what\s+does\s+.{0,20}bill|how\s+much\s+is\s+.{0,20}bill)",
+    re.IGNORECASE,
+)
+
+
+def build_conversion_reply(contact_id: str, state: dict,
+                           decision: ConversionDecision,
+                           prior_outbound: str = "",
+                           inbound_text: str = "") -> str:
+    """
+    A short, natural lead-in followed by the booking link.
+
+    Claude writes only the lead-in. Any model failure, empty output, or output
+    that tries to smuggle in a URL or a control tag falls back to a fixed
+    line — this path must never fail to produce a sendable message.
+    """
+    _verdict, _missing = qualification_verdict(state)
+    lead_in = ""
+    try:
+        _msgs = [
+            {"role": m["role"], "content": m["content"]}
+            for m in (state.get("messages") or [])
+            if m.get("role") in ("user", "assistant") and m.get("content")
+        ][-6:]
+        if not _msgs or _msgs[0].get("role") != "user":
+            _msgs = [{"role": "user", "content": "[Lead replied to a follow-up]"}] + _msgs
+        if _msgs[-1].get("role") != "user" or _msgs[-1].get("content") != inbound_text:
+            _msgs = _msgs + [{"role": "user", "content": inbound_text or "yes"}]
+
+        resp = claude.messages.create(
+            model      = MODEL,
+            max_tokens = 200,
+            system     = build_conversion_prompt(state, decision, prior_outbound),
+            messages   = _msgs,
+        )
+        lead_in, _tag = extract_control_tag(resp.content[0].text.strip())
+        lead_in = _ANY_URL_RE.sub("", lead_in).strip()
+        if len(lead_in) > 400:
+            lead_in = ""
+        # A message that asks instead of stating conditions defeats the point:
+        # the homeowner would have to answer before the link meant anything.
+        elif _missing and _ASKS_A_CRITERION_RE.search(lead_in):
+            ev("CONVERSION_LEADIN_REJECTED", contact_id, why="asked_instead_of_stating")
+            lead_in = ""
+    except Exception as err:
+        log.warning(f"[{contact_id}] conversion lead-in generation failed: {err}")
+        ev("CONVERSION_LEADIN_FALLBACK", contact_id, why=str(err)[:80])
+
+    if not lead_in:
+        lead_in = _conversion_fallback_line(contact_id, inbound_text, _missing)
+
+    return sanitize_outbound_message(f"{lead_in}\n{BOOKING_LINK}", contact_id)
+
+
+# ─────────────────────────────────────────────
 #  DYNAMIC SYSTEM PROMPT  [ADAPT-1]
 #
 #  Builds a context-aware system prompt for every
@@ -2358,7 +3473,8 @@ def build_process_answer(state: dict) -> str:
 #  the next qualification step or drive booking.
 # ─────────────────────────────────────────────
 
-def build_system_prompt(state: dict, ghl_pipeline_stage: str = "", ghl_tags: list | None = None) -> str:
+def build_system_prompt(state: dict, ghl_pipeline_stage: str = "", ghl_tags: list | None = None,
+                       prior_outbound: str = "", ask_only: str = "") -> str:
     """
     Build a state-aware system prompt for Michael.
 
@@ -2379,20 +3495,37 @@ def build_system_prompt(state: dict, ghl_pipeline_stage: str = "", ghl_tags: lis
     # Homeowner
     # Homeowner: implied confirmed only at ASK_BILL and beyond.
     # ASK_LOCATION stage no longer implies homeowner confirmed (area is now first question).
-    if stage in (Stage.ASK_BILL, Stage.SEND_BOOKING, Stage.BOOKED):
+    # [BUNDLE-1] Driven by the qualification record. Each criterion is its own
+    # tri-state, so "not asked yet" is never rendered as a confirmation — which
+    # is what a bare `location_confirmed` bool used to do.
+    _q_home = state.get("q_homeowner", QUAL_UNKNOWN) or QUAL_UNKNOWN
+    _q_util = state.get("q_utility", QUAL_UNKNOWN) or QUAL_UNKNOWN
+    _q_bill = state.get("q_bill_100_plus", QUAL_UNKNOWN) or QUAL_UNKNOWN
+
+    if _q_home == QUAL_YES or stage in (Stage.ASK_BILL, Stage.SEND_BOOKING, Stage.BOOKED) or homeown == "yes":
         confirmed.append("✓ HOMEOWNER: confirmed — do NOT ask about home ownership again")
-    elif homeown == "yes":
-        confirmed.append("✓ HOMEOWNER: confirmed (volunteered earlier) — do NOT ask again")
-    elif homeown == "no":
+    elif _q_home == QUAL_NO or homeown == "no":
         confirmed.append("✗ NOT A HOMEOWNER: they are renting — disqualify if not already done")
 
-    # Service area
+    # Utility — the criterion. Ameren Missouri only.
+    if _q_util == UTIL_AMEREN:
+        confirmed.append("✓ UTILITY: Ameren Missouri confirmed — do NOT ask about their electric provider again")
+    elif _q_util == UTIL_OTHER:
+        confirmed.append("✗ UTILITY: not Ameren Missouri — disqualify if not already done")
+    elif stage in (Stage.SEND_BOOKING, Stage.BOOKED):
+        confirmed.append("✓ UTILITY: confirmed — do NOT ask about their electric provider again")
+
+    # Service area is a separate fact: an address inside the metro says nothing
+    # about who supplies the electricity, so it never implies the criterion.
     if stage in (Stage.ASK_BILL, Stage.SEND_BOOKING, Stage.BOOKED) or loc_conf:
-        confirmed.append("✓ SERVICE AREA: confirmed — do NOT ask about location/area again")
+        confirmed.append("✓ SERVICE AREA: address is in the St. Louis metro — do NOT ask where they live")
 
     # Electric bill
-    if stage in (Stage.SEND_BOOKING, Stage.BOOKED):
-        confirmed.append("✓ ELECTRIC BILL: qualified — do NOT ask about bill again")
+    if _q_bill == QUAL_YES or stage in (Stage.SEND_BOOKING, Stage.BOOKED):
+        _amount = f" ({bill})" if bill else ""
+        confirmed.append(f"✓ ELECTRIC BILL: $100+/month confirmed{_amount} — do NOT ask about the bill again")
+    elif _q_bill == QUAL_NO:
+        confirmed.append("✗ ELECTRIC BILL: under $100/month — disqualify if not already done")
     elif bill:
         confirmed.append(f"✓ ELECTRIC BILL: mentioned as {bill} — do NOT ask about bill again")
 
@@ -2401,11 +3534,21 @@ def build_system_prompt(state: dict, ghl_pipeline_stage: str = "", ghl_tags: lis
         # If we reach here with nothing confirmed, the lead is genuinely at INITIAL
         # (no state yet), which should not happen for widget contacts — but handle
         # gracefully by starting at ownership (not area, since address was collected).
-        confirmed_block = "  Nothing confirmed yet — start with home ownership (step 1)."
+        confirmed_block = (
+            "  Nothing confirmed yet — state all three conditions together in one\n"
+            "  line rather than asking about them one at a time."
+        )
     else:
         confirmed_block = "\n".join(f"  {c}" for c in confirmed)
 
     # ── CURRENT GOAL ──────────────────────────────────────────────
+    # [BUNDLE-1] The three criteria decide what to ask, not the stage. The
+    # stage still wins for the terminal states below, which are about
+    # routing rather than qualification.
+    _qual_verdict, _qual_missing = qualification_verdict(state)
+    _ask_one = ask_only if ask_only in _MISSING_FIELD_GUIDANCE else (
+        _qual_missing[0] if len(_qual_missing) == 1 else ""
+    )
     if stage == Stage.SEND_BOOKING:
         current_goal = (
             "BOOKING — lead is FULLY QUALIFIED. "
@@ -2418,25 +3561,36 @@ def build_system_prompt(state: dict, ghl_pipeline_stage: str = "", ghl_tags: lis
         current_goal = "DISQUALIFIED — contact was already disqualified. Stay silent or acknowledge cleanly if they respond."
     elif stage == Stage.DNC:
         current_goal = "DNC — contact opted out. Do not respond."
-    elif stage == Stage.ASK_BILL or (homeown == "yes" and loc_conf and not bill):
-        current_goal = "ASK BILL — ask what the Ameren bill usually runs, conversationally and open-ended (e.g. 'About what does the Ameren bill usually run you? Even a rough guess is fine.'). Do NOT offer bracket choices. Accept any natural phrasing ('around 170', '150ish', 'couple hundred') and move on. When they give you a number, do NOT comment on its size and do NOT mention rates or savings — acknowledge it in four words or fewer and go straight to your next question or to booking. $100+/month: clearly qualified. $75–99: borderline, worth reviewing. Under $75: likely not a fit — say so honestly."
-    elif loc_conf and homeown != "yes":
-        # Area confirmed — move to ownership question next
-        current_goal = "ASK OWNERSHIP — ask 'Are you the homeowner?' (use that phrasing)."
-    elif homeown == "yes" and not loc_conf:
-        # Homeowner confirmed (volunteered early) but utility/area not yet checked
-        current_goal = "ASK UTILITY — confirm they are an Ameren Missouri customer in the St. Louis area (Missouri side only)."
-    elif stage == Stage.ASK_LOCATION and not loc_conf:
-        # Legacy stage label for old contacts — utility/area still needs to be answered
-        current_goal = "ASK UTILITY — confirm they are an Ameren Missouri customer in the St. Louis area (Missouri side only)."
-    else:
-        # Fallback — fires for INITIAL stage, legacy state, or manual resets.
-        # Widget leads have location_confirmed=True from form submission, so if
-        # loc_conf is False here, utility was the unanswered first question.
-        if loc_conf:
-            current_goal = "ASK OWNERSHIP — ask 'Are you the homeowner?' (use that phrasing)."
+    elif _qual_verdict == VERDICT_DISQUALIFIED:
+        # [BUNDLE-1] Name the criterion that failed so the decline is specific.
+        if state.get("q_homeowner") == QUAL_NO:
+            current_goal = "DISQUALIFY — they rent. Decline warmly in one line and emit [DISQUALIFY:NOT_OWNER]."
+        elif state.get("q_utility") == UTIL_OTHER:
+            current_goal = "DISQUALIFY — not Ameren Missouri. Decline warmly in one line and emit [DISQUALIFY:OUT_OF_AREA]."
         else:
-            current_goal = "ASK UTILITY — confirm they are an Ameren Missouri customer in the St. Louis area (Missouri side only)."
+            current_goal = "DISQUALIFY — bill is under $100/month. Say so honestly in one line and emit [DISQUALIFY:LOW_BILL]."
+    elif _qual_verdict == VERDICT_QUALIFIED:
+        current_goal = (
+            "BOOKING — all three criteria are confirmed. "
+            "Write one natural transition sentence, then append [SEND_BOOKING]. "
+            "Do NOT include a URL — the booking link is sent automatically. "
+            "Do NOT ask anything else first."
+        )
+    elif _ask_one in _MISSING_FIELD_GUIDANCE:
+        _label, _how = _MISSING_FIELD_GUIDANCE[_ask_one]
+        current_goal = (
+            f"ASK {_label.upper()} — this is the ONLY thing still unknown. {_how} "
+            f"Ask it and nothing else. Everything under WHAT YOU ALREADY KNOW is settled: "
+            f"re-asking any of it is a wrong reply. As soon as they confirm, go to booking."
+        )
+    else:
+        current_goal = (
+            "BUNDLED QUALIFICATION — two or more criteria are still unknown "
+            f"({', '.join(_qual_missing)}). Do NOT ask them one at a time. State the "
+            "conditions together in ONE casual line and offer to put the numbers "
+            "together if they apply. Vary the wording — never reuse a previous phrasing. "
+            "Skip any criterion already listed as confirmed above."
+        )
 
     # ── Tag-based qualification memory ────────────────────────────
     # GHL tags supplement the stage-based confirmed block with
@@ -2455,6 +3609,21 @@ def build_system_prompt(state: dict, ghl_pipeline_stage: str = "", ghl_tags: lis
         _tag_lines.append(f"✓ SERVICE AREA (from tag): confirmed — do NOT ask about utility/area again")
     if _tag_lines:
         confirmed_block = confirmed_block + "\n" + "\n".join(f"  {l}" for l in _tag_lines)
+
+    # ── [CONVERT-1] Previous outbound message ──────────────────────
+    # Reasoning about a one-word reply is impossible without knowing what
+    # it answers. Local memory is wiped by every restart and never contains
+    # GHL-sent nurture texts at all, so the caller may supply it instead.
+    _prev_out = (prior_outbound or "").strip() or last_outbound_message(state) \
+                or str(state.get("last_outbound_text") or "")
+    _prev_out_line = ""
+    if _prev_out:
+        _prev_out_line = (
+            f"\n━━ THE LAST MESSAGE YOU SENT ━━\n  {_prev_out.strip()[:400]}\n"
+            f"  (classified: {classify_outbound_intent(_prev_out)})\n"
+            f"  A short reply from the homeowner is answering THIS. Read it that\n"
+            f"  way before deciding what to say next.\n"
+        )
 
     # ── GHL pipeline stage block ───────────────────────────────────
     _ghl_stage_line = ""
@@ -2475,36 +3644,68 @@ def build_system_prompt(state: dict, ghl_pipeline_stage: str = "", ghl_tags: lis
 Your one job: qualify leads and book them for a free in-home solar consultation.
 Text like a calm, helpful, local person — short messages, natural tone, no hype.
 
-{_ghl_stage_line}━━ WHAT YOU ALREADY KNOW ABOUT THIS LEAD ━━
+{_ghl_stage_line}{_prev_out_line}━━ WHAT YOU ALREADY KNOW ABOUT THIS LEAD ━━
 {confirmed_block}
 
 CURRENT GOAL: {current_goal}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-QUALIFICATION ORDER — skip any step already confirmed above:
-1. UTILITY / SERVICE AREA?
-   Ask: "Are you on Ameren Missouri for electric?"
-   → Yes (Ameren Missouri, St. Louis-area MO): continue
-   → Illinois (Ameren Illinois) / rural co-op / non-Ameren utility:
-       "Got it — we focus on Ameren Missouri homeowners on the Missouri side of the St. Louis area, so we may not be the right fit yet. I'll keep your info on file in case anything changes." [DISQUALIFY:OUT_OF_AREA]
+QUALIFICATION CRITERIA — three things, and nothing else, decide whether this fits:
+1. They own the home
+2. They are on Ameren Missouri for electric (Missouri side — Ameren Illinois does not count)
+3. Their electric bill usually runs about $100/month or more
 
-2. OWN THE HOME?
-   Ask: "Are you the homeowner?" — use this phrasing.
-   Do NOT rephrase as "do you own the home" / "do you own your home". Those
-   variants have been blocked by carrier filters (error 30007) on multiple
-   contacts, while the questions either side of them delivered normally.
-   → Owner: continue
-   → Renter: "Got it — solar really only works for homeowners. If that ever changes, reach out." [DISQUALIFY:NOT_OWNER]
+DO NOT INTERROGATE. Never send these as three separate questions across three
+texts. That reads like a form, and people stop replying to forms.
 
-3. AVERAGE MONTHLY AMEREN BILL?
-   Ask: "About what does the Ameren bill usually run you? Even a rough guess is fine."
-   Accept ANY natural phrasing — "around 170", "like 200 in summer", "150ish", "couple hundred".
-   Never present bracket choices and never re-ask for a more exact figure once you have a ballpark.
-   → $100+/month: QUALIFIED → go to BOOKING immediately
-   → Under $100: "At that rate, the math is harder to make work. I'll keep your info on file in case it changes." [DISQUALIFY:LOW_BILL]
+WHEN TWO OR MORE ARE UNKNOWN — state them together in ONE casual line and let
+them confirm the lot at once. Vary the wording every single time; what follows
+is a shape, not a script:
+  "If you own the home, you're on Ameren, and the bill usually runs over $100
+   a month, I'm happy to put together what a $0-down option could look like
+   and answer any questions."
+  "As long as you own the place, have Ameren, and the electric bill is north of
+   $100 or so, I can pull the numbers together for you."
+  "If that's your home, you're with Ameren, and you're usually over $100 a month
+   on electric, I can show you what this would actually look like."
+Casual, professional, concise, low pressure. It is an offer with conditions
+attached — not a screening. Skip any criterion already confirmed above.
 
-NOTE: Service area is confirmed at form-submission time when address is provided.
-If "SERVICE AREA: confirmed" appears above, do NOT ask about utility — proceed directly to ownership.
+WHEN EXACTLY ONE IS UNKNOWN — ask only that one, in one short line. Never
+re-ask the other two.
+  "Perfect. And you're with Ameren for electric, right?"
+
+READING THEIR ANSWER
+• A yes to the bundled line confirms ALL THREE — all three is what you put to them.
+• Anything they state explicitly overrides that. "Yeah but I'm with Cuivre River"
+  is a yes to the offer and a no on utility.
+• Partial answers are normal and good. "$180 and I own it" leaves only the
+  utility open — ask that one thing, then go straight to booking.
+• A yes to a SINGLE question confirms only that one thing. "Yes" to "are you on
+  Ameren?" says nothing about ownership or the bill.
+• Never make them reconfirm anything under WHAT YOU ALREADY KNOW.
+
+PHRASING THAT MATTERS
+When you do ask about ownership on its own, use "Are you the homeowner?".
+Do NOT rephrase as "do you own the home" / "do you own your home" — those
+variants have been blocked by carrier filters (error 30007) on multiple
+contacts, while the questions either side of them delivered normally.
+For the bill, accept any natural phrasing — "around 170", "like 200 in summer",
+"150ish", "couple hundred". Never present bracket choices, and never re-ask for
+a more exact figure once you have a ballpark.
+
+WHEN A CRITERION FAILS
+  Renter        → "Got it — solar really only works for homeowners. If that ever changes, reach out." [DISQUALIFY:NOT_OWNER]
+  Not Ameren MO → "Got it — we focus on Ameren Missouri homeowners on the Missouri side of the St. Louis area, so we may not be the right fit yet. I'll keep your info on file in case anything changes." [DISQUALIFY:OUT_OF_AREA]
+  Under $100    → "At that rate, the math is harder to make work. I'll keep your info on file in case it changes." [DISQUALIFY:LOW_BILL]
+
+$0-DOWN — only ever as a possibility, only ever inside the bundled line:
+"$0-down options for homeowners who qualify". Never a promise, never a number,
+never "free".
+
+NOTE: Service area is confirmed at form-submission time when an address is
+provided. That is NOT the same as knowing their utility — an address in the
+metro says nothing about who bills them. Confirm Ameren separately.
 
 BOOKING — move here as soon as they qualify. Do NOT stall or ask extra questions.
 When they qualify, write ONE natural transition sentence then append [SEND_BOOKING].
@@ -2596,6 +3797,10 @@ transition, or a reason to reach out.
   sense — answer honestly and plainly using this context.
 • If they have NOT asked — do not mention rates, increases, bill size, seasons,
   or costs at all. Not as a lead-in, not as a comment, not "by the way".
+• ONE EXCEPTION: the bundled qualification line names the $100/month condition
+  and may offer a $0-down option for those who qualify. That is a condition of
+  the offer, not commentary on their bill, and it is the only place a figure
+  may appear unprompted. Never pair it with a claim, a saving, or a comparison.
 Unsolicited cost commentary gets messages blocked by mobile carriers, which means
 the homeowner never receives them. A blocked message helps nobody.
 
@@ -3400,11 +4605,20 @@ def increment_message_count(state: dict):
 #  CORE AGENT FUNCTION  [ADAPT-1,2,3]
 # ─────────────────────────────────────────────
 
-def michael_agent(contact_id: str, inbound_text: str, ghl_pipeline_stage: str = "", ghl_tags: list | None = None) -> Optional[str]:
+def michael_agent(contact_id: str, inbound_text: str, ghl_pipeline_stage: str = "",
+                  ghl_tags: list | None = None, prior_outbound: str = "") -> Optional[str]:
     """
     Main entry point for processing inbound SMS from a lead.
     Returns Michael's reply string, or None if no reply should be sent.
     Never raises — all errors are caught internally.
+
+    prior_outbound  [CONVERT-1] The last message WE sent, when the caller has
+        it. Optional and defaults to "", in which case local conversation
+        memory is used. It exists because the GHL nurture workflow sends
+        messages this service never sees — the "put together the numbers /
+        should I close this out" text being the one that mattered. Without
+        it a "Yes please" has no antecedent and falls through to whatever
+        qualification question the stage happens to point at.
     """
     try:
         state = get_state(contact_id)
@@ -3625,8 +4839,100 @@ def michael_agent(contact_id: str, inbound_text: str, ghl_pipeline_stage: str = 
             log.info(f"[{contact_id}] Booking confirmed via keyword shortcut.")
             return reply
 
+        # ══════════════════════════════════════════════════════════════
+        #  CONVERSION-FIRST DECISION STEP  [CONVERT-1]
+        #
+        #  Runs AFTER every hard stop above — STOP/DNC, disqualified, daily
+        #  limit and the booked lockout have all already returned. Nothing
+        #  here can reach a booked or opted-out contact, by position.
+        #
+        #  Runs BEFORE qualification so a homeowner who has just given
+        #  permission to move forward is taken up on it instead of being
+        #  walked back through questions. What a "yes" MEANS is decided from
+        #  the previous outbound message, not from the stage — see
+        #  decide_conversion_action().
+        # ══════════════════════════════════════════════════════════════
+        _prior_out = (prior_outbound or "").strip() or last_outbound_message(state)
+        if _prior_out and not state.get("last_outbound_text"):
+            state["last_outbound_text"] = _prior_out
+        _prev_type = classify_outbound_intent(_prior_out)
+        state["last_outbound_intent"] = _prev_type
+
         # ── Parse inbound for state signals [ADAPT-2] ─────────────
-        update_state_from_inbound(state, inbound_text)
+        # The original parser runs FIRST and untouched. It takes its own
+        # _loc_conf_before snapshot to stop one "yes" confirming two separate
+        # questions, and writing to the record before it would corrupt that.
+        update_state_from_inbound(state, inbound_text, previous_outbound_type=_prev_type)
+
+        # ── [BUNDLE-1] Update the qualification record ─────────────
+        # Sync, extract, apply, sync again: the first sync pulls in anything
+        # the legacy parser just learned, the second pushes the record back
+        # out to the fields tags and stage-restore read.
+        sync_qualification_fields(state)
+        _facts = extract_qualification_facts(inbound_text, previous_outbound_type=_prev_type)
+        apply_qualification_facts(state, _facts, contact_id)
+        sync_qualification_fields(state)
+        _verdict, _missing = qualification_verdict(state)
+        print(f"[QUAL] {qualification_summary(state)}", flush=True)
+
+        _decision = decide_conversion_action(state, inbound_text, prior_outbound=_prior_out)
+        _ask_only = _decision.missing_field if _decision.action == ACT_ASK_MISSING else ""
+
+        ev(
+            "CONVERSION_DECISION", contact_id,
+            intent=_decision.intent,
+            previous_outbound_type=_decision.previous_outbound_type,
+            action=_decision.action,
+            reason=_decision.reason,
+            stage=str(state["stage"]),
+            verdict=_verdict,
+            missing=",".join(_missing) or "(none)",
+            homeowner=state.get("q_homeowner"),
+            utility=state.get("q_utility"),
+            bill_100_plus=state.get("q_bill_100_plus"),
+        )
+        print(
+            f"[AGENT] 🎯 intent={_decision.intent} | "
+            f"previous_outbound_type={_decision.previous_outbound_type} | "
+            f"action={_decision.action} | why={_decision.reason}",
+            flush=True,
+        )
+
+        # ── HIGH-INTENT CONVERSION PATH ───────────────────────────
+        # A short, human lead-in plus the booking link, and nothing else.
+        # Claude never sees the qualification prompt on this path, so it
+        # cannot emit a qualification question even if it wanted to.
+        if _decision.action == ACT_SEND_BOOKING:
+            _conv_reply = build_conversion_reply(
+                contact_id, state, _decision,
+                prior_outbound=_prior_out,
+                inbound_text=inbound_text,
+            )
+            state["stage"] = Stage.SEND_BOOKING
+            state["booking_detected"] = True
+            state["pending_question"] = "send_booking"
+            # [BUNDLE-2] `qualified` means the three criteria are confirmed —
+            # NOT that a link went out. Susan said yes to an invitation, which
+            # is high intent and nothing more; the criteria travelled with the
+            # link for her to self-qualify against. Setting the flag here would
+            # have the record claim she told us things she never said.
+            if _verdict == VERDICT_QUALIFIED:
+                state["qualified"] = True
+            state["messages"].append({"role": "user",      "content": inbound_text})
+            state["messages"].append({"role": "assistant", "content": _conv_reply})
+            state["last_outbound_text"] = _conv_reply
+            increment_message_count(state)
+            save_state(contact_id, state)
+            ev(
+                "CONVERSION_BOOKING_SENT", contact_id,
+                intent=_decision.intent,
+                previous_outbound_type=_decision.previous_outbound_type,
+                action=_decision.action,
+                verdict=_verdict,
+                criteria_included=",".join(_missing) or "(none)",
+            )
+            print(f"[AGENT] ✅ (conversion path) Reply: {_conv_reply!r}", flush=True)
+            return _conv_reply
 
         # ── Detect intent [FIX-5] ─────────────────────────────────
         intent    = detect_intent(inbound_text)
@@ -3679,14 +4985,16 @@ def michael_agent(contact_id: str, inbound_text: str, ghl_pipeline_stage: str = 
         # ── Build dynamic, context-aware system prompt [ADAPT-1] ──
         # NOTE: build_system_prompt() is ONLY called for unbooked contacts.
         # Booked contacts exit via the BOOKED LOCKOUT above.
-        system = build_system_prompt(state, ghl_pipeline_stage=ghl_pipeline_stage, ghl_tags=ghl_tags)
+        system = build_system_prompt(state, ghl_pipeline_stage=ghl_pipeline_stage, ghl_tags=ghl_tags,
+                                     prior_outbound=_prior_out, ask_only=_ask_only)
         _current_goal = _goal_from_prompt(system)
         print(f"[AGENT] Goal: {_current_goal}")
 
         # Track which qualification question we're about to ask (v3.6+ pending_question).
         # Persisted so the next inbound turn knows what "yes/no" is responding to.
         _pq = "none"
-        if "ASK UTILITY" in _current_goal:     _pq = "utility"
+        if "BUNDLED QUALIFICATION" in _current_goal: _pq = "bundled"
+        elif "ASK UTILITY" in _current_goal:   _pq = "utility"
         elif "ASK OWNERSHIP" in _current_goal: _pq = "ownership"
         elif "ASK BILL" in _current_goal:      _pq = "bill"
         elif "BOOKING" in _current_goal:       _pq = "send_booking"
@@ -3778,8 +5086,20 @@ def michael_agent(contact_id: str, inbound_text: str, ghl_pipeline_stage: str = 
             state["stage"] = Stage.ASK_OWNERSHIP if state.get("location_confirmed") else Stage.ASK_LOCATION
 
         # ── Infer confirmed facts from stage transitions [ADAPT-3] ─
-        # If we advanced past ownership, homeowner is confirmed.
-        if state["stage"] in (Stage.ASK_LOCATION, Stage.ASK_BILL, Stage.SEND_BOOKING, Stage.BOOKED):
+        # Only stages that genuinely come AFTER the ownership question may
+        # imply ownership.
+        #
+        # [BUNDLE-3] ASK_LOCATION used to be in this list, from the flow where
+        # ownership was asked before location. The order was later reversed —
+        # utility/service area is now the first question — which made
+        # ASK_LOCATION mean the exact opposite: the utility question is still
+        # pending, so ownership has NOT been asked yet. The stale entry
+        # silently set homeowner="yes" for anyone sitting on that first
+        # question, and build_system_prompt() then printed "HOMEOWNER:
+        # confirmed", so the question was never asked and renters could reach
+        # the booking link unqualified. build_system_prompt()'s own confirmed
+        # block had already been corrected; this inference had not.
+        if state["stage"] in (Stage.ASK_BILL, Stage.SEND_BOOKING, Stage.BOOKED):
             if state.get("homeowner") is None:
                 state["homeowner"] = "yes"
         # If we advanced past location, area is confirmed.
@@ -3789,11 +5109,21 @@ def michael_agent(contact_id: str, inbound_text: str, ghl_pipeline_stage: str = 
         if state["stage"] in (Stage.SEND_BOOKING, Stage.BOOKED):
             state["qualified"] = True
 
+        # [BUNDLE-3] Reconcile the record with whatever the stage transition
+        # just decided, in the same turn rather than on the next inbound.
+        # Without this the legacy fields and the record disagree until the
+        # homeowner replies again, and the prompt is built from the stale half.
+        sync_qualification_fields(state)
+
         # ── [FIX-6] Sanitise before sending — catch any hallucinated URL ──
         clean_reply = sanitize_outbound_message(clean_reply, contact_id)
 
         # ── Append assistant reply to history ─────────────────────
         state["messages"].append({"role": "assistant", "content": clean_reply})
+        state["last_outbound_text"] = clean_reply
+        if is_bundled_qualification_message(clean_reply):
+            state["bundled_offer_sent"] = True
+            ev("BUNDLED_OFFER_SENT", contact_id, criteria=bundled_criteria_mentioned(clean_reply))
         increment_message_count(state)
         save_state(contact_id, state)
 
@@ -3990,6 +5320,102 @@ _APPT_DEAD_STATUSES: frozenset = frozenset({
 _APPT_LIST_KEYS  = ("appointments", "events", "data", "items")
 _APPT_STATUS_KEYS = ("appointmentStatus", "status", "appointment_status")
 _APPT_START_KEYS  = ("startTime", "startAt", "start_time", "start")
+
+
+# ── [CONVERT-1] Last outbound message recovery ───────────────────────────
+#
+#  WHY
+#    Nurture and breakup texts are sent by GHL workflows. They never pass
+#    through this service, so state["messages"] cannot contain them, and a
+#    restart empties that list for everything else too. Without the text of
+#    the question, an inbound "Yes please" is uninterpretable and the agent
+#    falls back to whatever the stage points at — which is how a lead who
+#    said yes to "want me to put together the numbers?" got asked "Are you
+#    the homeowner?".
+#
+#  BEST EFFORT, ALWAYS
+#    Every failure mode returns "" and the caller proceeds exactly as it did
+#    before this function existed. It is called only when local memory has no
+#    outbound message AND the inbound looks like an affirmative or a
+#    scheduling request, so it adds no latency to the common path.
+_MSG_LIST_KEYS = ("messages", "data", "items")
+_MSG_BODY_KEYS = ("body", "message", "text")
+
+
+def _extract_outbound_body(messages: list) -> str:
+    """Newest outbound SMS body from a GHL messages list, or ''."""
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        direction = str(m.get("direction") or m.get("messageDirection") or "").lower()
+        if direction and direction != "outbound":
+            continue
+        for k in _MSG_BODY_KEYS:
+            body = m.get(k)
+            if isinstance(body, str) and body.strip():
+                return body.strip()
+    return ""
+
+
+async def fetch_last_outbound_message(contact_id: str) -> str:
+    """
+    The most recent outbound SMS body GHL has for this contact, or "".
+
+    Never raises and never blocks a reply: any error, timeout, unexpected
+    shape or missing credential yields "".
+    """
+    if not contact_id or not GHL_API_KEY or not GHL_LOCATION_ID:
+        return ""
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.post(
+                f"{GHL_API_BASE}/conversations/search",
+                headers=_ghl_headers(_GHL_HEADERS_V2),
+                json={"locationId": GHL_LOCATION_ID, "contactId": contact_id, "limit": 1},
+            )
+            if not r.is_success:
+                r = await client.get(
+                    f"{GHL_API_BASE}/conversations/search",
+                    headers=_ghl_headers(_GHL_HEADERS_V2),
+                    params={"locationId": GHL_LOCATION_ID, "contactId": contact_id, "limit": 1},
+                )
+            if not r.is_success:
+                ev("PRIOR_OUTBOUND_LOOKUP_FAILED", contact_id, step="conversations", code=r.status_code)
+                return ""
+
+            data  = r.json() if r.content else {}
+            convs = (data or {}).get("conversations") or (data or {}).get("data") or []
+            if not convs or not isinstance(convs[0], dict):
+                return ""
+            conv_id = str(convs[0].get("id") or convs[0].get("_id") or "").strip()
+            if not conv_id:
+                return ""
+
+            rm = await client.get(
+                f"{GHL_API_BASE}/conversations/{conv_id}/messages",
+                headers=_ghl_headers(_GHL_HEADERS_V2),
+                params={"limit": 20},
+            )
+            if not rm.is_success:
+                ev("PRIOR_OUTBOUND_LOOKUP_FAILED", contact_id, step="messages", code=rm.status_code)
+                return ""
+
+            payload = rm.json() if rm.content else {}
+            bucket  = (payload or {}).get("messages") or payload or {}
+            if isinstance(bucket, dict):
+                msgs = next((bucket[k] for k in _MSG_LIST_KEYS if isinstance(bucket.get(k), list)), [])
+            else:
+                msgs = bucket if isinstance(bucket, list) else []
+
+        body = _extract_outbound_body(msgs)
+        if body:
+            ev("PRIOR_OUTBOUND_RECOVERED", contact_id,
+               classified=classify_outbound_intent(body), chars=len(body))
+        return body
+    except Exception as err:
+        log.warning(f"[{contact_id}] last-outbound lookup failed (non-fatal): {err}")
+        ev("PRIOR_OUTBOUND_LOOKUP_FAILED", contact_id, step="exception", why=str(err)[:80])
+        return ""
 
 
 async def _fetch_contact_tags_ex(contact_id: str) -> tuple[bool, list[str]]:
@@ -4287,14 +5713,22 @@ def apply_restored_stage(contact_id: str, state: dict,
 
     state["stage"] = _stage
     state["location_confirmed"] = True
-    if _stage in (Stage.SEND_BOOKING, Stage.BOOKED):
+    # [BUNDLE-2] BOOKING_LINK_SENT on its own means the link went out, which the
+    # conversion path now does before the criteria are known. Only the explicit
+    # QUALIFIED tag — or an actual booking — is evidence they answered.
+    if _stage == Stage.BOOKED or (_stage == Stage.SEND_BOOKING and has_tag(tags, "QUALIFIED")):
         state["qualified"] = True
         if not state.get("homeowner"):
             state["homeowner"] = "yes"
     if _stage == Stage.SEND_BOOKING:
         state["booking_detected"] = True
 
-    ev("STAGE_RESTORED_FROM_GHL", contact_id, stage=str(_stage), why=_why)
+    # [BUNDLE-2] Reconcile the record with whatever the restore just decided,
+    # so the next prompt reflects it without waiting for an inbound message.
+    sync_qualification_fields(state)
+
+    ev("STAGE_RESTORED_FROM_GHL", contact_id, stage=str(_stage), why=_why,
+       qualification=qualification_summary(state))
     return _why
 
 
@@ -4307,6 +5741,11 @@ def classify_reply_kind(state: dict) -> SendKind:
         return SendKind.OPT_OUT
     if state.get("appointment_booked") or state.get("stage") == Stage.BOOKED:
         return SendKind.BOOKED_REPLY
+    # [CONVERT-1] A reply sent at SEND_BOOKING carries the booking link, so it
+    # is a booking pitch. Both classes sit in _BOOKED_GUARDED, so the booked
+    # check is unchanged — this only makes the suppression log say which.
+    if state.get("stage") == Stage.SEND_BOOKING:
+        return SendKind.BOOKING_PITCH
     return SendKind.QUALIFICATION
 
 
@@ -4579,7 +6018,18 @@ async def add_ghl_tags(contact_id: str, new_tags: list[str]) -> bool:
         return False
 
 
-def resolve_ghl_tags(stage: Stage) -> list[str]:
+def resolve_ghl_tags(stage: Stage, qualified: bool = True) -> list[str]:
+    """
+    GHL tags for a stage.
+
+    [BUNDLE-2] `qualified=False` writes BOOKING_LINK_SENT without QUALIFIED,
+    for a high-intent lead who got the link with the criteria attached but
+    has not confirmed them. restore_stage_from_ghl() matches on EITHER tag,
+    so recovery still resumes at SEND_BOOKING — the only thing that changes
+    is that nothing in GHL claims a qualification nobody gave.
+    """
+    if stage == Stage.SEND_BOOKING and not qualified:
+        return ["BOOKING_LINK_SENT"]
     tag_map = {
         Stage.SEND_BOOKING : ["QUALIFIED", "BOOKING_LINK_SENT"],
         Stage.BOOKED       : ["APPOINTMENT_BOOKED"],
@@ -6493,9 +7943,28 @@ async def inbound_webhook(request: Request):
                     print(f"[PIPELINE] ❌ Bill ack send failed: {_ack_err}", flush=True)
             return JSONResponse({"status": "success", "action": "bill_photo_ack", "stage": _ghl_stage})
 
+        # ── [CONVERT-1] Resolve what we actually said last ────────
+        # Local memory first (free). GHL only when memory is empty AND the
+        # reply is the ambiguous kind whose meaning depends on the question —
+        # so the lookup never runs for ordinary messages.
+        _prior_outbound = last_outbound_message(_pre_agent_state)
+        if not _prior_outbound and (
+            is_affirmative_reply(inbound_text) or is_explicit_scheduling_request(inbound_text)
+        ):
+            _prior_outbound = await fetch_last_outbound_message(contact_id)
+        if _prior_outbound:
+            print(
+                f"[REPLY]  prior outbound  : {classify_outbound_intent(_prior_outbound)} | "
+                f"{_prior_outbound[:90]!r}",
+                flush=True,
+            )
+        else:
+            print(f"[REPLY]  prior outbound  : (unknown — no local history, none recovered)", flush=True)
+
         # ── Run the agent ─────────────────────────────────────────
         print(f"[REPLY] ▶ Calling michael_agent() | stage={_pre_stage} | ghl_stage={_ghl_stage!r} | msg={inbound_text!r}", flush=True)
-        reply = michael_agent(contact_id, inbound_text, ghl_pipeline_stage=_ghl_stage, ghl_tags=_ghl_tags)
+        reply = michael_agent(contact_id, inbound_text, ghl_pipeline_stage=_ghl_stage,
+                              ghl_tags=_ghl_tags, prior_outbound=_prior_outbound)
 
         # ── Post-agent state snapshot ─────────────────────────────
         _post_state    = get_state(contact_id)
@@ -6576,7 +8045,7 @@ async def inbound_webhook(request: Request):
 
         state         = _post_state
         contact_phone = state.get("phone", "") or phone
-        ghl_tags      = resolve_ghl_tags(state["stage"])
+        ghl_tags      = resolve_ghl_tags(state["stage"], qualified=bool(state.get("qualified")))
         print(f"[REPLY]  Phone             : {contact_phone or '(not available)'}", flush=True)
         print(f"[REPLY]  GHL tags to apply : {ghl_tags}", flush=True)
         print(f"[REPLY]  ▶ Calling send_sms_via_ghl() now ...", flush=True)
