@@ -905,6 +905,14 @@ def ghl_stage_to_internal(ghl_stage: str) -> "Optional[Stage]":
 def get_state(contact_id: str) -> dict:
     if contact_id not in _state_store:
         _state_store[contact_id] = {
+            # ── SMS compliance ledger ───────────────────────────
+            "sms_opt_out"           : False,    # consumer opt-out - NEVER text
+            "sms_ineligible"        : False,    # number cannot receive SMS
+            "sms_failure_category"  : "",
+            "sms_failure_code"      : "",
+            "sms_failure_at"        : "",
+            "fallback_pending"      : False,    # preserved for Phase 2. NOT contacted.
+            "fallback_email"        : "",
             # Core qualification stage
             "stage"                 : Stage.INITIAL,
             # Claude conversation history
@@ -3919,17 +3927,87 @@ def extract_control_tag(text: str) -> tuple[str, Optional[Stage]]:
 #  KEYWORD DETECTORS
 # ─────────────────────────────────────────────
 
+# ── Two-tier opt-out detection ────────────────────────────────────
+#
+# BUG FIXED: the single regex below matched any occurrence of
+# "stop"/"cancel"/"end" anywhere in a sentence, permanently DNC-ing
+# legitimate conversations. Confirmed false positives:
+#     "I want to cancel my Ameren service"      (a BUYING signal)
+#     "Can you stop by Saturday?"
+#     "I need to cancel Tuesday, can we do Thursday?"
+#     "What time does the appointment end?"
+# 10 of 12 sampled natural phrases were misclassified as opt-outs.
+#
+# TIER 1 - CTIA keyword as a STANDALONE message (carrier-recognised).
+# TIER 2 - unambiguous natural-language revocation phrases.
+# Anything else is ordinary conversation and is NOT an opt-out.
+#
+# LEGACY: STOP_KEYWORDS is retained (unused by is_stop_request) so any
+# external reference keeps importing cleanly.
 STOP_KEYWORDS = re.compile(
     r"\b(stop|quit|cancel|end|unsubscribe|opt.?out|remove me|take me off)\b",
     re.IGNORECASE,
 )
+
+CTIA_OPT_OUT_KEYWORDS = frozenset({
+    "stop", "stopall", "stop all", "unsubscribe", "cancel", "end", "quit",
+    "optout", "opt out", "revoke", "arret", "arretez",
+})
+
+_OPT_OUT_FILLERS = frozenset({"please", "pls", "plz", "just", "now", "texts",
+                              "text", "texting", "messages", "msgs", "me", "all"})
+
+REVOCATION_PHRASES = (
+    "stop contacting me", "stop texting me", "stop messaging me",
+    "quit texting me", "do not contact me", "don't contact me",
+    "do not text me", "don't text me", "do not call or text",
+    "don't call or text", "never contact me", "lose my number",
+    "take me off your list", "take me off the list", "remove me from your list",
+    "remove me from everything", "remove me completely", "delete my info",
+    "delete my information", "unsubscribe me", "not interested stop",
+)
+
+
+def _normalize_for_optout(text: str) -> str:
+    """Lowercase, strip punctuation, collapse whitespace."""
+    t = (text or "").lower().strip()
+    t = "".join(ch if (ch.isalnum() or ch.isspace()) else " " for ch in t)
+    return " ".join(t.split())
+
+
+def is_explicit_opt_out(text: str) -> bool:
+    """TIER 1 - CTIA keyword sent as a standalone message."""
+    t = _normalize_for_optout(text)
+    if not t:
+        return False
+    if t in CTIA_OPT_OUT_KEYWORDS:
+        return True
+    tokens = t.split()
+    if len(tokens) <= 3:
+        core = [w for w in tokens if w not in _OPT_OUT_FILLERS]
+        if core and " ".join(core) in CTIA_OPT_OUT_KEYWORDS:
+            return True
+    return False
+
+
+def is_revocation_intent(text: str) -> bool:
+    """TIER 2 - unambiguous natural-language revocation."""
+    t = _normalize_for_optout(text)
+    if not t:
+        return False
+    return any(_normalize_for_optout(p) in t for p in REVOCATION_PHRASES)
 
 BOOKED_KEYWORDS = re.compile(
     r"\b(booked|scheduled|just booked|i booked|confirmed|i scheduled|set it up|grabbed a time)\b",
     re.IGNORECASE,
 )
 
-def is_stop_request(text: str)         -> bool: return bool(STOP_KEYWORDS.search(text))
+def is_stop_request(text: str) -> bool:
+    """
+    True only for a genuine opt-out.
+    Signature and name unchanged - all existing callers work untouched.
+    """
+    return is_explicit_opt_out(text) or is_revocation_intent(text)
 def is_booking_confirmation(text: str) -> bool: return bool(BOOKED_KEYWORDS.search(text))
 
 
@@ -3985,6 +4063,550 @@ def has_tag(tags: list | None, wanted: str) -> bool:
     """Case-insensitive membership test against a GHL tags list."""
     w = wanted.lower().strip()
     return any(str(t).lower().strip() == w for t in (tags or []))
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  [QH] TCPA SEND WINDOW + SMS COMPLIANCE
+#
+#  Built on main's existing primitives - no parallel implementations:
+#    add_ghl_tags()          additive tag write (GET -> merge -> PUT)
+#    has_tag()               case-insensitive membership
+#    classify_carrier_error() single source of truth for code permanence
+#    SendStatus.SUPPRESSED   the established "we did not send" contract
+#    ev()                    structured event logging
+#    _record_send_result()   caller-side state persistence
+# ═══════════════════════════════════════════════════════════════════
+
+# Documented behaviour (KC_EnergyAdvisors_System_Architecture.docx):
+#   "Send hours 9 AM - 9 PM Central only"
+# CENTRAL_TZ is ZoneInfo("America/Chicago") so DST comes from the tz
+# database - never a fixed UTC offset.
+#
+# Boundaries (inclusive start, exclusive end):
+#   08:59 CLOSED | 09:00 OPEN | 20:59 OPEN | 21:00 CLOSED | 21:01 CLOSED
+SEND_WINDOW_START_HOUR = 9    # 09:00 inclusive
+SEND_WINDOW_END_HOUR   = 21   # 21:00 exclusive
+
+#   TAG_AFTER_HOURS_HOLD - the durable pending queue. GHL is the store;
+#                  nothing pending ever lives in Python memory, so a
+#                  Render restart cannot lose a held message.
+TAG_AFTER_HOURS_HOLD    = "after-hours-hold"
+TAG_AFTER_HOURS_EXPIRED = "after-hours-hold-expired"
+
+# An obsolete hold is cleared WITHOUT sending. A reply most of a day late
+# reads as disconnected. 9 PM -> 9:05 AM is ~12h, so 18h leaves slack for
+# the GHL retry ladder while expiring anything older than a day.
+QH_MAX_HOLD_AGE_HOURS = 18
+
+# Reasons attached to a SendStatus.SUPPRESSED result. Callers already
+# branch on `status not in _STATUS_ADVANCES_STATE`; these explain why.
+SUPPRESS_REASON_DND    = "compliance_dnd"
+SUPPRESS_REASON_WINDOW = "outside_send_window"
+
+# Process-local observability only. The AUTHORITATIVE queue is the GHL
+# tag; these reset on restart and are exposed via /health.
+_qh_stats: dict = {
+    "holds_placed"      : 0,
+    "hold_failures"     : 0,
+    "resumes_processed" : 0,
+    "resumes_skipped"   : 0,
+    "resumes_sent"      : 0,
+    "last_hold_at"      : "",
+    "last_resume_at"    : "",
+    "last_hold_failure_at"      : "",
+    "last_hold_failure_contact" : "",
+}
+
+
+def within_send_window(now=None) -> bool:
+    """True when automated outbound SMS is permitted. DST-aware."""
+    if now is None:
+        now = datetime.now(tz=CENTRAL_TZ)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=CENTRAL_TZ)
+    local = now.astimezone(CENTRAL_TZ)
+    return SEND_WINDOW_START_HOUR <= local.hour < SEND_WINDOW_END_HOUR
+
+
+def send_window_status(now=None) -> dict:
+    """Non-sensitive window description for /health."""
+    if now is None:
+        now = datetime.now(tz=CENTRAL_TZ)
+    local = now.astimezone(CENTRAL_TZ)
+    return {
+        "open"        : within_send_window(local),
+        "now_central" : local.isoformat(timespec="seconds"),
+        "tz_abbrev"   : local.strftime("%Z"),
+        "utc_offset"  : local.strftime("%z"),
+        "window"      : f"{SEND_WINDOW_START_HOUR:02d}:00-"
+                        f"{SEND_WINDOW_END_HOUR:02d}:00 America/Chicago",
+    }
+
+
+def hold_age_hours(timestamp) -> float | None:
+    """Hours since an ISO-8601 or epoch-ms timestamp. None if unparseable."""
+    if not timestamp:
+        return None
+    try:
+        if isinstance(timestamp, (int, float)) or str(timestamp).isdigit():
+            n = float(timestamp)
+            if n > 1e11:
+                n /= 1000.0
+            when = datetime.fromtimestamp(n, tz=CENTRAL_TZ)
+        else:
+            when = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+        return (datetime.now(tz=CENTRAL_TZ) - when).total_seconds() / 3600.0
+    except Exception:
+        return None
+
+
+# ── GSM-7 transliteration ─────────────────────────────────────────
+# A single non-GSM-7 character forces the WHOLE message into UCS-2,
+# dropping the segment limit from 160 chars to 70. One em dash turns a
+# 167-char first SMS into 3 segments instead of 1 - 3x cost on every
+# first touch plus extra carrier-filtering scrutiny.
+_GSM7_SUBSTITUTIONS = {
+    "—": "-",  "–": "-",  "‒": "-",  "−": "-",
+    "‘": "'",  "’": "'",  "‚": "'",  "′": "'",
+    "“": '"',  "”": '"',  "„": '"',  "″": '"',
+    "…": "...", " ": " ",  " ": " ",  " ": " ",
+    " ": " ",  " ": " ",  "•": "-",  "·": "-",
+    "™": "(TM)", "®": "(R)", "©": "(C)",
+}
+
+_GSM7_CHARSET = set(
+    "@£$¥èéùìòÇ\nØø\rÅå"
+    "Δ_ΦΓΛΩΠΨΣΘΞÆæßÉ"
+    " !\"#¤%&'()*+,-./0123456789:;<=>?"
+    "¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§"
+    "¿abcdefghijklmnopqrstuvwxyzäöñüà"
+) | set("^{}\\[~]|€")
+
+
+def to_gsm7_safe(text: str, contact_id: str = "") -> str:
+    """Transliterate common Unicode punctuation to GSM-7 equivalents.
+    Idempotent. Wording is never altered - only glyphs."""
+    if not text:
+        return text
+    out = text
+    for bad, good in _GSM7_SUBSTITUTIONS.items():
+        if bad in out:
+            out = out.replace(bad, good)
+    residual = sorted({c for c in out if c not in _GSM7_CHARSET})
+    if residual:
+        ev("GSM7_RESIDUAL", contact_id, chars=residual,
+           note="message will send as UCS-2 (70-char segments)")
+    return out
+
+
+# ── SMS failure classification ────────────────────────────────────
+# GHL records the provider reason inside dndSettings.SMS.message as free
+# text, e.g. "TWILIO_ERROR_CODE: 30006" or "STOP_KEYWORD". Confirmed
+# against 20 live contacts.
+#
+# PERMANENCE IS NOT DECIDED HERE. classify_carrier_error() is the single
+# source of truth for that and already covers 30003/30004/30005/30006/
+# 21211/21610/21614/30007.
+_PROVIDER_CODE_RE = re.compile(
+    r"(?:TWILIO_ERROR_CODE|ERROR_CODE|CODE)\s*[:=]?\s*(\d{4,6})", re.IGNORECASE)
+
+# Provider code -> semantic category. Answers "why", not "retry?".
+SMS_FAILURE_CATEGORY = {
+    "21610": "CARRIER_SUPPRESSION",
+    "21211": "UNREACHABLE_OR_BAD_NUMBER",
+    "21214": "UNREACHABLE_OR_BAD_NUMBER",
+    "21614": "UNREACHABLE_OR_BAD_NUMBER",
+    "30003": "UNREACHABLE_OR_BAD_NUMBER",
+    "30005": "UNREACHABLE_OR_BAD_NUMBER",
+    "30006": "UNREACHABLE_OR_BAD_NUMBER",
+    "30004": "A2P_OR_CARRIER_FILTERING",
+    "30007": "A2P_OR_CARRIER_FILTERING",
+    "30032": "A2P_OR_CARRIER_FILTERING",
+    "30034": "A2P_OR_CARRIER_FILTERING",
+}
+
+
+def extract_provider_code(*sources) -> str:
+    """Pull a provider error code out of any free-text status string."""
+    for src in sources:
+        if not src:
+            continue
+        m = _PROVIDER_CODE_RE.search(str(src))
+        if m:
+            return m.group(1)
+        m2 = re.search(r"\b(2[01]\d{3}|30\d{3})\b", str(src))
+        if m2:
+            return m2.group(1)
+    return ""
+
+
+def classify_sms_failure(dnd_sms: dict | None = None,
+                         http_status: int | None = None,
+                         response_body=None) -> tuple:
+    """
+    Returns (category, provider_code, permanently_ineligible).
+
+    Categories: EXPLICIT_OPT_OUT | CARRIER_SUPPRESSION |
+                UNREACHABLE_OR_BAD_NUMBER | A2P_OR_CARRIER_FILTERING |
+                CONFIG_ERROR | PRE_EXISTING_DND | UNKNOWN
+
+    Permanence is delegated to classify_carrier_error().
+    FAILS CLOSED: anything unrecognised returns UNKNOWN, which the gate
+    treats as "do not send".
+    """
+    dnd_sms = dnd_sms or {}
+    status  = str(dnd_sms.get("status") or "").strip().lower()
+    msg     = str(dnd_sms.get("message") or "")
+    code    = str(dnd_sms.get("code") or "")
+
+    # 1. Explicit consumer opt-out - highest precedence, never overridden.
+    if "stop_keyword" in msg.lower() or status == "permanent":
+        return "EXPLICIT_OPT_OUT", "", True
+
+    # 2. Provider error code embedded in the DND message.
+    provider = extract_provider_code(msg, code, response_body)
+    if provider:
+        category  = SMS_FAILURE_CATEGORY.get(provider, "A2P_OR_CARRIER_FILTERING")
+        permanent = classify_carrier_error(provider) == "permanent"
+        return category, provider, permanent
+
+    # 3. HTTP-level configuration problems.
+    if http_status and int(http_status) in (400, 401, 403, 404, 422):
+        return "CONFIG_ERROR", str(http_status), False
+
+    # 4. DND is on but the API did not disclose why - fail closed.
+    if status:
+        return "PRE_EXISTING_DND", "", False
+
+    return "UNKNOWN", "", False
+
+
+# ── Compliance state from GHL ─────────────────────────────────────
+async def fetch_ghl_contact_compliance(contact_id: str) -> dict:
+    """
+    Fetch phone, email, tags AND compliance state in ONE call.
+
+    GET /contacts/{id} already returns `dnd` and `dndSettings`.
+    fetch_ghl_contact_phone() downloads that payload and throws the
+    compliance fields away, which is why the agent has been blind to DND.
+    """
+    blank = {"ok": False, "first_name": "", "full_name": "", "phone": "",
+             "email": "", "dnd": None, "dnd_sms": {}, "tags": [],
+             "date_added": "", "http": None}
+    if not contact_id:
+        return blank
+    url = f"{GHL_API_BASE}/contacts/{contact_id}"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(url, headers=_ghl_headers(_GHL_HEADERS_V2))
+        if not r.is_success:
+            ev("COMPLIANCE_LOOKUP_FAILED", contact_id, http=r.status_code)
+            return {**blank, "http": r.status_code}
+        data    = r.json()
+        contact = data.get("contact") or data
+        phone   = (contact.get("phone") or contact.get("mobilePhone")
+                   or contact.get("homePhone") or "")
+        dnd_settings = contact.get("dndSettings") or {}
+        dnd_sms = dnd_settings.get("SMS") or dnd_settings.get("sms") or {}
+        _tags = contact.get("tags") or []
+        _fn = str(contact.get("firstName") or contact.get("first_name") or "").strip()
+        _ln = str(contact.get("lastName") or contact.get("last_name") or "").strip()
+        return {
+            "ok"        : True,
+            "first_name": _fn,
+            "full_name" : (f"{_fn} {_ln}".strip() or
+                           str(contact.get("contactName") or "").strip()),
+            "phone"     : str(phone).strip() if phone else "",
+            "email"     : str(contact.get("email") or "").strip(),
+            "dnd"       : contact.get("dnd"),
+            "dnd_sms"   : dnd_sms if isinstance(dnd_sms, dict) else {},
+            "tags"      : list(_tags) if isinstance(_tags, list) else [],
+            "date_added": contact.get("dateAdded") or contact.get("createdAt") or "",
+            "http"      : r.status_code,
+        }
+    except Exception as err:
+        ev("COMPLIANCE_LOOKUP_ERROR", contact_id, error=str(err)[:120])
+        return blank
+
+
+async def can_contact_sms(contact_id: str, state: dict | None = None) -> dict:
+    """
+    FAIL-CLOSED pre-send compliance gate.
+
+    The ONLY authority on whether an outbound SMS may be transmitted.
+    Returns {"allowed": bool, "reason": str, "category": str,
+             "code": str, "permanent": bool, "phone": str, "email": str}
+
+    Denies when:
+      * local state records a permanent suppression
+      * GHL reports SMS DND active/permanent
+      * the compliance lookup fails or is ambiguous  <- fails CLOSED
+
+    There is deliberately NO override parameter. A legitimate opt-out
+    cannot be bypassed by any caller.
+    """
+    state = state if isinstance(state, dict) else {}
+
+    if state.get("sms_opt_out") is True:
+        return {"allowed": False, "reason": "local ledger: consumer opt-out",
+                "category": "EXPLICIT_OPT_OUT", "code": "", "permanent": True,
+                "phone": "", "email": ""}
+    if state.get("sms_ineligible") is True:
+        return {"allowed": False,
+                "reason": f"local ledger: number cannot receive SMS "
+                          f"({state.get('sms_failure_code') or 'n/a'})",
+                "category": state.get("sms_failure_category") or "UNREACHABLE_OR_BAD_NUMBER",
+                "code": state.get("sms_failure_code") or "", "permanent": True,
+                "phone": "", "email": ""}
+
+    c = await fetch_ghl_contact_compliance(contact_id)
+    if not c["ok"]:
+        return {"allowed": False,
+                "reason": "compliance lookup failed - failing closed",
+                "category": "UNKNOWN", "code": "", "permanent": False,
+                "phone": "", "email": ""}
+
+    dnd_sms = c["dnd_sms"] or {}
+    status  = str(dnd_sms.get("status") or "").strip().lower()
+    if c["dnd"] is True or (status and status not in ("inactive", "")):
+        cat, code, permanent = classify_sms_failure(dnd_sms)
+        return {"allowed": False,
+                "reason": f"GHL SMS DND active (status={status or 'account-wide'})",
+                "category": cat, "code": code, "permanent": permanent,
+                "phone": c["phone"], "email": c["email"]}
+
+    return {"allowed": True, "reason": "no SMS DND on record",
+            "category": "", "code": "", "permanent": False,
+            "phone": c["phone"], "email": c["email"]}
+
+
+async def record_sms_outcome(contact_id: str, category: str, code: str,
+                             permanent: bool, email: str = "") -> None:
+    """
+    Persist a classified compliance outcome.
+
+    Complements _record_send_result(), which records SUCCESS metadata
+    (last_send_status / last_message_id). This records WHY a send was
+    refused and what that means for future contactability.
+
+    [R1] A confirmed opt-out is ALSO written to GHL as the durable DNC
+    tag set, because state["stage"] alone does not survive a restart -
+    apply_restored_stage() rebuilds stage from GHL evidence, and without
+    the tag a DNC set here would be silently downgraded. The tag list
+    comes from resolve_ghl_tags(Stage.DNC) so there is exactly one
+    definition of "what DNC looks like in GHL".
+
+    Sends NO fallback message. The only GHL write is the DNC tag.
+    """
+    try:
+        st = get_state(contact_id)
+    except Exception:
+        return
+    st["sms_failure_category"] = category
+    st["sms_failure_code"]     = code
+    st["sms_failure_at"]       = datetime.now(tz=CENTRAL_TZ).isoformat(timespec="seconds")
+    if category == "EXPLICIT_OPT_OUT":
+        # A CONFIRMED opt-out permanently suppresses automated SMS AND
+        # short-circuits michael_agent() at its DNC guard, so future
+        # inbound never reaches Claude.
+        #
+        # FALSE-POSITIVE SAFETY: this branch is reachable ONLY when
+        # classify_sms_failure() returns EXPLICIT_OPT_OUT, which requires
+        # GHL's own authoritative record ("STOP_KEYWORD" in
+        # dndSettings.SMS.message, or status == "permanent"). It is never
+        # reached from conversational text matching.
+        st["sms_opt_out"]    = True
+        st["sms_ineligible"] = True
+        st["stage"]          = Stage.DNC
+        _dnc_tags = resolve_ghl_tags(Stage.DNC)
+        try:
+            _tagged = await add_ghl_tags(contact_id, _dnc_tags)
+        except Exception as _tag_err:
+            _tagged = False
+            log.warning(f"[{contact_id}] DNC tag write failed (non-fatal): {_tag_err}")
+        ev("DNC_PERSISTED", contact_id, tags=_dnc_tags, durable=_tagged,
+           note="stage=DNC now survives restart via GHL tag"
+                if _tagged else "IN-MEMORY ONLY - tag write failed")
+    elif permanent:
+        st["sms_ineligible"]   = True
+        st["fallback_pending"] = True      # preserved for a future channel
+        st["fallback_email"]   = email or st.get("fallback_email", "")
+    try:
+        save_state(contact_id, st)
+    except Exception:
+        pass
+    ev("SMS_OUTCOME_RECORDED", contact_id, category=category,
+       code=code or "(none)", permanent=permanent,
+       fallback_pending=st.get("fallback_pending", False))
+
+
+# ── After-hours hold (durable queue = one GHL tag) ────────────────
+async def remove_ghl_tags(contact_id: str, drop_tags: list) -> bool:
+    """
+    Remove tags from a GHL contact WITHOUT dropping the others.
+    Mirrors add_ghl_tags()'s GET -> merge -> PUT shape so the codebase
+    has ONE tag-write convention. Non-fatal.
+    """
+    if not (contact_id and drop_tags and GHL_API_KEY):
+        return False
+    url = f"{GHL_API_BASE}/contacts/{contact_id}"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(url, headers=_ghl_headers(_GHL_HEADERS_V2))
+            if not r.is_success:
+                log.warning(f"[{contact_id}] remove_ghl_tags: GET failed ({r.status_code})")
+                return False
+            contact  = (r.json() or {}).get("contact") or (r.json() or {})
+            existing = [str(t) for t in (contact.get("tags") or [])]
+            drop     = {t.lower().strip() for t in drop_tags}
+            kept     = [t for t in existing if t.lower().strip() not in drop]
+            if len(kept) == len(existing):
+                return True      # nothing to remove - already clear
+            w = await client.put(url, json={"tags": kept}, headers=_ghl_headers(_GHL_HEADERS_V2))
+            if not w.is_success:
+                log.warning(f"[{contact_id}] remove_ghl_tags: PUT failed ({w.status_code})")
+                return False
+        log.info(f"[{contact_id}] tags removed: {drop_tags} (kept {len(kept)})")
+        return True
+    except Exception as err:
+        log.warning(f"[{contact_id}] remove_ghl_tags failed (non-fatal): {err}")
+        return False
+
+
+async def place_after_hours_hold(contact_id: str) -> bool:
+    """
+    Mark the contact as pending in GHL - the durable queue.
+
+    Delegates to add_ghl_tags(), which already reads existing tags,
+    short-circuits when the tag is present (idempotent - a lost response
+    is not a second event), and never replaces the tag array.
+    """
+    if not contact_id:
+        return False
+    ok = await add_ghl_tags(contact_id, [TAG_AFTER_HOURS_HOLD])
+    if ok:
+        _qh_stats["holds_placed"] += 1
+        _qh_stats["last_hold_at"] = datetime.now(tz=CENTRAL_TZ).isoformat(timespec="seconds")
+        ev("AFTER_HOURS_HOLD_PLACED", contact_id, tag=TAG_AFTER_HOURS_HOLD)
+    else:
+        _qh_stats["hold_failures"] += 1
+        _qh_stats["last_hold_failure_at"] = datetime.now(tz=CENTRAL_TZ).isoformat(timespec="seconds")
+        _qh_stats["last_hold_failure_contact"] = contact_id
+        ev("AFTER_HOURS_HOLD_FAILED", contact_id,
+           note="no durable hold - contact will NOT auto-resume")
+    return ok
+
+
+async def clear_after_hours_hold(contact_id: str) -> bool:
+    """Remove the pending marker. Idempotent."""
+    ok = await remove_ghl_tags(contact_id, [TAG_AFTER_HOURS_HOLD])
+    ev("AFTER_HOURS_HOLD_CLEARED", contact_id, ok=ok)
+    return ok
+
+
+async def fetch_latest_conversation_signal(contact_id: str) -> dict:
+    """
+    Read the CURRENT conversation from GHL at resume time.
+
+    GHL's message thread is the durable record of what happened overnight;
+    _state_store does not survive a Render restart.
+
+    Returns {"ok", "latest_inbound", "last_direction", "inbound_count",
+             "latest_inbound_at", "history"} where history is oldest-first
+    and EXCLUDES the newest inbound (michael_agent appends that itself).
+    """
+    blank = {"ok": False, "latest_inbound": "", "last_direction": "",
+             "inbound_count": 0, "latest_inbound_at": "", "history": []}
+    if not contact_id:
+        return blank
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            r = await client.get(f"{GHL_API_BASE}/conversations/search",
+                                 params={"locationId": GHL_LOCATION_ID,
+                                         "contactId": contact_id, "limit": 5},
+                                 headers=_ghl_headers(_GHL_HEADERS_V2))
+            if not r.is_success:
+                return blank
+            convos = (r.json() or {}).get("conversations") or []
+            if not convos:
+                return {**blank, "ok": True}
+            conv_id = convos[0].get("id")
+            if not conv_id:
+                return {**blank, "ok": True}
+            m = await client.get(f"{GHL_API_BASE}/conversations/{conv_id}/messages",
+                                 params={"limit": 25}, headers=_ghl_headers(_GHL_HEADERS_V2))
+            if not m.is_success:
+                return blank
+            msgs = (m.json() or {}).get("messages")
+            if isinstance(msgs, dict):
+                msgs = msgs.get("messages") or []
+            msgs = msgs if isinstance(msgs, list) else []
+    except Exception as err:
+        ev("QH_CONVERSATION_LOOKUP_ERROR", contact_id, error=str(err)[:120])
+        return blank
+
+    latest_inbound, last_direction, inbound_count = "", "", 0
+    latest_inbound_at, latest_inbound_id = "", ""
+    ordered = []
+    for msg in msgs:                       # GHL returns newest-first
+        if not isinstance(msg, dict):
+            continue
+        d = str(msg.get("direction") or "").lower()
+        if d not in ("inbound", "outbound"):
+            continue
+        body = str(msg.get("body") or msg.get("message") or "").strip()
+        ordered.append({"id": msg.get("id") or "", "direction": d, "body": body})
+        if not last_direction:
+            last_direction = d
+        if d == "inbound":
+            inbound_count += 1
+            if not latest_inbound and body:
+                latest_inbound    = body
+                latest_inbound_at = str(msg.get("dateAdded") or
+                                        msg.get("dateUpdated") or "")
+                latest_inbound_id = msg.get("id") or ""
+
+    ordered.reverse()                      # oldest-first for Claude
+    history = []
+    for msg in ordered:
+        if latest_inbound_id and msg["id"] == latest_inbound_id:
+            continue
+        if not msg["body"]:
+            continue
+        history.append({
+            "role"   : "user" if msg["direction"] == "inbound" else "assistant",
+            "content": msg["body"],
+        })
+    return {"ok": True, "latest_inbound": latest_inbound,
+            "last_direction": last_direction, "inbound_count": inbound_count,
+            "latest_inbound_at": latest_inbound_at, "history": history[-20:]}
+
+
+def rebuild_history_from_ghl(contact_id: str, history: list) -> int:
+    """
+    Restore Claude conversation context after a Render restart.
+
+    Without this, a morning reply answers the newest message with ZERO
+    preceding context and reads as disconnected.
+
+    Only fills an EMPTY history - never clobbers live in-memory state.
+    Anthropic requires messages[0].role == "user", so a leading assistant
+    turn is dropped. Returns the number of turns restored.
+    """
+    if not history:
+        return 0
+    st = get_state(contact_id)
+    if st.get("messages"):
+        return 0                            # live state wins
+    restored = list(history)
+    while restored and restored[0].get("role") == "assistant":
+        restored.pop(0)
+    if not restored:
+        return 0
+    st["messages"] = restored
+    save_state(contact_id, st)
+    ev("QH_CONTEXT_REBUILT", contact_id, turns=len(restored))
+    return len(restored)
 
 
 _INVALID_NAMES = {"unknown", "none", "", "admin", "admin notifications", "notifications"}
@@ -4564,6 +5186,8 @@ def sanitize_outbound_message(text: str, contact_id: str = "") -> str:
     clean public booking URL and the replacement is logged. Idempotent — clean
     messages pass through at zero cost.
     """
+    text = to_gsm7_safe(text, contact_id)
+
     if not _BAD_BOOKING_URL_RE.search(text):
         return text   # fast path — nothing to do
 
@@ -5804,6 +6428,72 @@ async def send_sms_via_ghl(contact_id: str, message: str, to_number: str = "",
                 "response_body": None,
             }
         ev("SEND_ALLOWED_NOT_BOOKED", contact_id, kind=kind.value, why=_why)
+
+    # ══════════════════════════════════════════════════════════════
+    #  [COMPLIANCE-GATE] Fail-closed DND check.
+    #
+    #  Runs immediately after the booked guard and BEFORE the window
+    #  gate on purpose: a genuine opt-out is refused outright and never
+    #  receives an after-hours hold tag. There is no bypass parameter.
+    #  Applies to EVERY kind, including OPT_OUT confirmations - GHL
+    #  itself sends the STOP confirmation, so we must not.
+    # ══════════════════════════════════════════════════════════════
+    _state_for_gate = get_state(contact_id)
+    _gate = await can_contact_sms(contact_id, _state_for_gate)
+    if not _gate["allowed"]:
+        ev("SEND_SUPPRESSED_COMPLIANCE", contact_id, kind=kind.value,
+           category=_gate["category"], code=_gate["code"] or "(none)",
+           why=_gate["reason"])
+        await record_sms_outcome(contact_id, _gate["category"], _gate["code"],
+                                 _gate["permanent"], email=_gate.get("email", ""))
+        return {
+            "status"       : SendStatus.SUPPRESSED.value,
+            "accepted"     : False,
+            "delivered"    : None,
+            "message_id"   : "",
+            "sent"         : False,
+            "suppressed"   : True,
+            "reason"       : SUPPRESS_REASON_DND,
+            "category"     : _gate["category"],
+            "code"         : _gate["code"],
+            "why"          : _gate["reason"],
+            "deduped"      : False,
+            "status_code"  : None,
+            "response_body": None,
+        }
+
+    # Gate resolved an authoritative phone - use it when caller had none.
+    if not (to_number or "").strip() and _gate.get("phone"):
+        to_number = _gate["phone"]
+
+    # ══════════════════════════════════════════════════════════════
+    #  [SEND-WINDOW-GATE] TCPA 9AM-9PM America/Chicago.
+    #
+    #  Placed here so EVERY outbound path is covered - outreach,
+    #  qualification, booking pitch, nurture, bill ack, booked replies.
+    #  Nothing is generated or frozen for later: the contact is marked
+    #  in GHL and reprocessed from scratch in the next permitted window.
+    # ══════════════════════════════════════════════════════════════
+    if not within_send_window():
+        _ws   = send_window_status()
+        _held = await place_after_hours_hold(contact_id)
+        ev("SEND_DEFERRED_OUTSIDE_WINDOW", contact_id, kind=kind.value,
+           now_central=_ws["now_central"], window=_ws["window"],
+           hold_placed=_held)
+        return {
+            "status"       : SendStatus.SUPPRESSED.value,
+            "accepted"     : False,
+            "delivered"    : None,
+            "message_id"   : "",
+            "sent"         : False,
+            "suppressed"   : True,
+            "reason"       : SUPPRESS_REASON_WINDOW,
+            "hold_placed"  : _held,
+            "why"          : f"outside send window ({_ws['now_central']})",
+            "deduped"      : False,
+            "status_code"  : None,
+            "response_body": None,
+        }
 
     # ── Outbound duplicate suppression [ADAPT-6] ──────────────────
     if is_duplicate_outbound(contact_id, message):
@@ -8979,9 +9669,229 @@ async def root():
     """Render health check — must return 200 instantly."""
     return {"status": "ok"}
 
+@app.post("/webhook/after-hours-resume")
+async def after_hours_resume(request: Request):
+    """
+    Morning resume for contacts held overnight.
+
+    GHL calls this during the permitted window for any contact carrying
+    the `after-hours-hold` tag. Python is the authoritative decision
+    layer: it re-evaluates EVERYTHING from live sources and generates a
+    FRESH reply. No response is ever frozen at 2 AM and thawed at 9 AM.
+
+    Revalidation order (all must pass, else the hold is cleared and
+    nothing is sent):
+      1. inside the send window      -> never send outside 9AM-9PM Central
+      2. hold tag still present      -> durable idempotency (survives restart)
+      3. genuine opt-out / Stage.DNC -> clear, never send
+      4. live GHL DND                -> clear, never send
+      5. booked / appointment lockout-> clear, never send   (booked_verdict)
+      6. daily message limit         -> leave hold, retry next window
+      7. hold age > QH_MAX_HOLD_AGE  -> expire, clear, never send
+      8. current conversation state  -> if we already replied, unnecessary
+      9. can_contact_sms()           -> runs again inside send_sms_via_ghl
+
+    Always returns HTTP 200 so GHL never retry-storms.
+    """
+    try:
+        raw = await request.body()
+    except Exception:
+        raw = b""
+    try:
+        body = json.loads(raw) if raw else {}
+        if not isinstance(body, dict):
+            body = {}
+    except Exception:
+        try:
+            body = dict(parse_qs(raw.decode("utf-8", errors="replace"))) if raw else {}
+        except Exception:
+            body = {}
+
+    def _pick(*keys) -> str:
+        for k in keys:
+            v = body.get(k)
+            if isinstance(v, list):
+                v = v[0] if v else None
+            if v not in (None, "", []):
+                return str(v).strip()
+        return ""
+
+    _nested = body.get("contact")
+    _nested = _nested if isinstance(_nested, dict) else {}
+    contact_id = (_pick("contact_id", "contactId", "id")
+                  or str(_nested.get("id") or "").strip())
+
+    _qh_stats["resumes_processed"] += 1
+    _qh_stats["last_resume_at"] = datetime.now(tz=CENTRAL_TZ).isoformat(timespec="seconds")
+
+    def _skip(reason: str, **extra):
+        _qh_stats["resumes_skipped"] += 1
+        ev("QH_RESUME_SKIPPED", contact_id, reason=reason, **extra)
+        payload = {"status": "skipped", "reason": reason, "sms_sent": False}
+        payload.update(extra)
+        return JSONResponse(payload)
+
+    if not contact_id:
+        return _skip("no_contact_id")
+
+    # ── 1. Send window (free check, before any GHL work) ──────────
+    if not within_send_window():
+        return _skip("outside_send_window", hold_retained=True)
+
+    # ── 2. Hold tag still present? (durable idempotency) ──────────
+    compliance = await fetch_ghl_contact_compliance(contact_id)
+    if not compliance["ok"]:
+        return _skip("compliance_lookup_failed", hold_retained=True)
+
+    if not has_tag(compliance.get("tags"), TAG_AFTER_HOURS_HOLD):
+        return _skip("hold_already_cleared", duplicate_fire=True)
+
+    # ── 3. Genuine opt-out / Stage.DNC ────────────────────────────
+    state = get_state(contact_id)
+    if state.get("sms_opt_out") is True or state.get("stage") == Stage.DNC:
+        await clear_after_hours_hold(contact_id)
+        return _skip("consumer_opt_out", hold_cleared=True)
+
+    # ── 4. Live GHL DND ───────────────────────────────────────────
+    _dnd_sms = compliance.get("dnd_sms") or {}
+    _dnd_status = str(_dnd_sms.get("status") or "").strip().lower()
+    if compliance.get("dnd") is True or (_dnd_status and _dnd_status != "inactive"):
+        _cat, _code, _perm = classify_sms_failure(_dnd_sms)
+        await record_sms_outcome(contact_id, _cat, _code, _perm,
+                                 email=compliance.get("email", ""))
+        await clear_after_hours_hold(contact_id)
+        return _skip("dnd_active", category=_cat, code=_code, hold_cleared=True)
+
+    # ── 5. Booked lockout - reuse main's authoritative verdict ────
+    _verdict, _why = await booked_verdict(contact_id)
+    if _verdict is not False:          # True (booked) OR None (unknown)
+        await clear_after_hours_hold(contact_id)
+        return _skip("booked_lockout", hold_cleared=True,
+                     verdict=("booked" if _verdict else "indeterminate"),
+                     why=_why)
+
+    # ── 6. Daily message limit (hold retained, retry next window) ─
+    if not within_daily_limit(state):
+        return _skip("daily_limit", hold_retained=True)
+
+    # ── 7. Current conversation + staleness ───────────────────────
+    convo = await fetch_latest_conversation_signal(contact_id)
+    if not convo["ok"]:
+        return _skip("conversation_lookup_failed", hold_retained=True)
+
+    _age = hold_age_hours(convo.get("latest_inbound_at") or
+                          compliance.get("date_added"))
+    if _age is not None and _age > QH_MAX_HOLD_AGE_HOURS:
+        await add_ghl_tags(contact_id, [TAG_AFTER_HOURS_EXPIRED])
+        await clear_after_hours_hold(contact_id)
+        return _skip("hold_expired", age_hours=round(_age, 1), hold_cleared=True)
+
+    # ── 8. Already answered since the overnight inbound ───────────
+    if convo["last_direction"] == "outbound":
+        await clear_after_hours_hold(contact_id)
+        return _skip("already_replied", hold_cleared=True)
+
+    _ghl_tags = list(compliance.get("tags") or [])
+
+    if not convo["latest_inbound"]:
+        if convo["last_direction"] == "":
+            # No conversation at all -> a FIRST OUTREACH deferred overnight
+            # (e.g. a Meta lead form submitted at 2 AM). Generate the opener
+            # now, fresh, using the same builder the live path uses.
+            ev("QH_RESUME_FIRST_OUTREACH", contact_id)
+            reply = build_new_contact_outreach(
+                first_name  = compliance.get("first_name", ""),
+                full_name   = compliance.get("full_name", ""),
+                address     = "",
+                lead_source = state.get("lead_source", ""),
+                tags        = _ghl_tags,
+            )
+            _kind = SendKind.OUTREACH
+            if state.get("stage") == Stage.INITIAL:
+                state["stage"] = Stage.ASK_OWNERSHIP
+            increment_message_count(state)
+            state["messages"].append({
+                "role": "user",
+                "content": (f"[Lead submitted form after hours - "
+                            f"name: {compliance.get('full_name') or 'Unknown'}, "
+                            f"contacted at first permitted send window]")})
+            state["messages"].append({"role": "assistant", "content": reply})
+            save_state(contact_id, state)
+        else:
+            await clear_after_hours_hold(contact_id)
+            return _skip("no_inbound", hold_cleared=True)
+    else:
+        # Restore Claude context if _state_store was wiped by a restart.
+        # No-op when live state already has history.
+        _restored = rebuild_history_from_ghl(contact_id, convo.get("history") or [])
+        ev("QH_RESUME_GENERATING", contact_id,
+           inbound_count=convo["inbound_count"], ctx_restored=_restored)
+        # Evaluated ONCE: several overnight messages collapse into the
+        # single most recent inbound -> at most one morning response.
+        reply = michael_agent(contact_id, convo["latest_inbound"],
+                              ghl_pipeline_stage="", ghl_tags=_ghl_tags)
+        _kind = classify_reply_kind(get_state(contact_id))
+
+    if not reply:
+        await clear_after_hours_hold(contact_id)
+        return _skip("agent_no_reply", hold_cleared=True)
+
+    # ── 9. Phase 1 compliance gate runs inside send_sms_via_ghl ───
+    _send = await send_sms_via_ghl(contact_id, reply,
+                                   to_number=compliance.get("phone", ""),
+                                   kind=_kind)
+    _record_send_result(contact_id, get_state(contact_id), _send)
+
+    if _send.get("status") not in _STATUS_ADVANCES_STATE:
+        _reason = _send.get("reason") or _send.get("why") or "(none)"
+        ev("QH_RESUME_NOT_SENT", contact_id, status=_send.get("status"),
+           reason=_reason, note="homeowner did NOT receive this")
+        # A compliance/window refusal is terminal for this hold; a
+        # transient rejection keeps it for the next ladder rung.
+        _terminal = _reason in (SUPPRESS_REASON_DND, "booked_guard")
+        if _terminal:
+            await clear_after_hours_hold(contact_id)
+        return JSONResponse({"status": "failed", "reason": "not_sent",
+                             "send_status": _send.get("status"),
+                             "suppress_reason": _reason,
+                             "hold_cleared": _terminal,
+                             "hold_retained": not _terminal,
+                             "sms_sent": False})
+
+    await clear_after_hours_hold(contact_id)
+    _qh_stats["resumes_sent"] += 1
+    ev("QH_RESUME_SENT", contact_id, message_id=_send.get("message_id") or "(none)")
+    return JSONResponse({"status": "success", "sms_sent": True,
+                         "message_id": _send.get("message_id", ""),
+                         "hold_cleared": True})
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    """
+    Queue observability without exposing contact data.
+
+    The AUTHORITATIVE pending queue is the GHL `after-hours-hold` tag -
+    these counters are process-local and reset on restart. A stuck queue
+    shows as: window open, holds_placed > 0, resumes_processed == 0.
+    No names, phone numbers, emails or message bodies are returned.
+    """
+    return {
+        "status"      : "ok",
+        "send_window" : send_window_status(),
+        "after_hours" : {
+            "holds_placed_since_boot"      : _qh_stats["holds_placed"],
+            "hold_failures_since_boot"     : _qh_stats["hold_failures"],
+            "resumes_processed_since_boot" : _qh_stats["resumes_processed"],
+            "resumes_skipped_since_boot"   : _qh_stats["resumes_skipped"],
+            "resumes_sent_since_boot"      : _qh_stats["resumes_sent"],
+            "last_hold_at"                 : _qh_stats["last_hold_at"],
+            "last_resume_at"               : _qh_stats["last_resume_at"],
+            "last_hold_failure_at"         : _qh_stats["last_hold_failure_at"],
+            "last_hold_failure_contact"    : _qh_stats["last_hold_failure_contact"],
+            "authoritative_queue"          : f"GHL tag '{TAG_AFTER_HOURS_HOLD}'",
+        },
+    }
 
 
 # ── Website chat system prompt ────────────────────────────────────────────────
