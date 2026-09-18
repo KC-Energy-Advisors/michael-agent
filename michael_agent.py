@@ -9837,9 +9837,26 @@ async def after_hours_resume(request: Request):
         return _skip("agent_no_reply", hold_cleared=True)
 
     # ── 9. Phase 1 compliance gate runs inside send_sms_via_ghl ───
-    _send = await send_sms_via_ghl(contact_id, reply,
-                                   to_number=compliance.get("phone", ""),
-                                   kind=_kind)
+    #
+    # send_sms_via_ghl() returns a SUPPRESSED dict for policy refusals, but
+    # still RAISES on a GHL 4xx/5xx (raise_for_status). An HTTP rejection is
+    # not a compliance decision and must not escape as a 500: GHL would then
+    # retry this webhook on top of its own recovery ladder, double-firing the
+    # same contact. Keep the hold so the ladder owns the retry, and return
+    # 200 exactly as this endpoint's contract promises.
+    try:
+        _send = await send_sms_via_ghl(contact_id, reply,
+                                       to_number=compliance.get("phone", ""),
+                                       kind=_kind)
+    except Exception as _send_err:
+        ev("QH_RESUME_SEND_ERROR", contact_id,
+           error=f"{type(_send_err).__name__}: {str(_send_err)[:140]}",
+           note="hold RETAINED - recovery ladder will retry")
+        log.error(f"[{contact_id}] QH resume send raised: {_send_err}")
+        return JSONResponse({"status": "failed", "reason": "send_exception",
+                             "hold_retained": True, "hold_cleared": False,
+                             "sms_sent": False})
+
     _record_send_result(contact_id, get_state(contact_id), _send)
 
     if _send.get("status") not in _STATUS_ADVANCES_STATE:

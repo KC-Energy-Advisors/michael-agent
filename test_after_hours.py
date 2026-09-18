@@ -124,6 +124,12 @@ class Resp:
     def json(s):
         if s._p is None: raise ValueError("not json")
         return s._p
+    def raise_for_status(s):
+        # Faithful to httpx: 4xx/5xx raises. main's send_sms_via_ghl
+        # relies on this, so the fake must too or the test is a lie.
+        if not s.is_success:
+            raise RuntimeError(f"Client error '{s.status_code}' for url (mock)")
+        return s
 
 def stub_compliance(result):
     async def _f(cid): return result
@@ -486,6 +492,61 @@ run(M.record_sms_outcome("a16b", "UNREACHABLE_OR_BAD_NUMBER", "30006", True, "x@
 chk("30006 writes NO DNC tag", any(M.TAG_DNC in t for t in TAGW), False, "A16")
 chk("30006 stage NOT DNC", M.get_state("a16b")["stage"] == M.Stage.DNC, False, "A16")
 chk("30006 still fallback_pending", M.get_state("a16b")["fallback_pending"], True, "A16")
+
+sec("A17 - GHL 4xx DURING RESUME MUST NOT 500")
+# Regression: send_sms_via_ghl still calls raise_for_status(), so an HTTP
+# rejection used to propagate out of the endpoint as a 500 - which would
+# make GHL retry the webhook ON TOP of its own recovery ladder.
+REJ = []
+class RejectC:
+    def __init__(s,*a,**k): pass
+    async def __aenter__(s): return s
+    async def __aexit__(s,*a): return False
+    async def get(s,url,**k):
+        if "/appointments" in url: return Resp(200,{"events":[]})
+        if "/opportunities" in url: return Resp(200,{"opportunities":[]})
+        if "/contacts/" in url:
+            return Resp(200,{"contact":{**CLEAN,"tags":["after-hours-hold"]}})
+        if "/conversations/search" in url: return Resp(200,{"conversations":[{"id":"CV1"}]})
+        if "/messages" in url: return Resp(200,{"messages":THREAD})
+        return Resp(200,{})
+    async def post(s,url,**k):
+        REJ.append(url)
+        if "/conversations/messages" in url:
+            return Resp(400,{"message":"toNumber is invalid"})   # GHL rejects
+        return Resp(201,{})
+    async def put(s,url,**k):
+        REJ.append(("PUT",url,k.get("json",{}).get("tags",[])))
+        return Resp(200,{})
+
+M.michael_agent = _stub_agent
+force(True)          # A13 restored the real clock; this group needs the window OPEN
+M._state_store.clear(); REJ.clear()
+M.httpx.AsyncClient = RejectC
+_r17 = run(M.after_hours_resume(Req({"contact_id":"a17"})))
+_o17 = json.loads(bytes(_r17.body).decode())
+chk("HTTP 200 not 500", _r17.status_code, 200, "A17")
+chk("status failed", _o17["status"], "failed", "A17")
+chk("reason send_exception", _o17["reason"], "send_exception", "A17")
+chk("hold RETAINED (non-terminal)", _o17["hold_retained"], True, "A17")
+chk("hold NOT cleared", _o17["hold_cleared"], False, "A17")
+chk("sms_sent False", _o17["sms_sent"], False, "A17")
+chk("hold tag never removed",
+    any(isinstance(x,tuple) and M.TAG_AFTER_HOURS_HOLD not in x[2] and x[2]
+        for x in REJ), False, "A17")
+# 5xx must behave the same way
+class Reject5(RejectC):
+    async def post(s,url,**k):
+        if "/conversations/messages" in url: return Resp(503,{"message":"upstream"})
+        return Resp(201,{})
+M._state_store.clear(); M.httpx.AsyncClient = Reject5
+_r5 = run(M.after_hours_resume(Req({"contact_id":"a17b"})))
+_o5 = json.loads(bytes(_r5.body).decode())
+chk("503 -> HTTP 200", _r5.status_code, 200, "A17")
+chk("503 -> hold retained", _o5["hold_retained"], True, "A17")
+chk("503 -> sms_sent False", _o5["sms_sent"], False, "A17")
+M.michael_agent = _real_agent
+M.within_send_window = _real_window
 
 sec("A14 - /health (no PII)")
 h = run(M.health())
