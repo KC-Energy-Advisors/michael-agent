@@ -10448,6 +10448,61 @@ async def debug_set_stage(contact_id: str, request: Request):
 #  HEALTH CHECK
 # ─────────────────────────────────────────────
 
+@app.get("/debug/form-schema")
+async def debug_form_schema(request: Request):
+    """
+    [FORM-AWARE] Read-only pre-flight: did the GHL custom-field schema
+    resolve, and are the fields this feature depends on actually present?
+
+    WHY THIS EXISTS
+      The schema lookup only runs behind FORM_AWARE_ENABLED, so a dark deploy
+      has no way to prove the field ids will resolve BEFORE the feature is
+      switched on. Since the production webhook sends no custom data, the
+      contact-record path is the only source of form answers - and this is
+      the only way to verify it works without going live first.
+
+    SAFETY
+      Reads the LOCATION field definitions only. No contact is fetched, no
+      state is touched, nothing is sent. Returns field KEY NAMES and booleans
+      only - no values, no ids, no contact data. Secret-guarded by the same
+      DEBUG_RESET_SECRET as the other debug endpoints, and hard-disabled
+      (503) when that secret is unset.
+    """
+    _auth = _debug_auth_error(request)
+    if _auth:
+        return _auth
+
+    schema = await fetch_ghl_custom_field_schema(force=True)
+    found  = sorted(set(schema.values()))
+
+    def _present(key: str) -> bool:
+        want = key.strip().lower()
+        return any(t == want or t.rsplit(".", 1)[-1] == want for t in found)
+
+    required = {k: _present(k) for k in
+                (FORM_FIELD_HOMEOWNER, FORM_FIELD_UTILITY, FORM_FIELD_BILL)}
+    managed  = {k: _present(k) for k in
+                (FORM_FIELD_QUAL_STATUS, FORM_FIELD_QUAL_MISSING,
+                 FORM_FIELD_SEEN_AT)}
+
+    ok = bool(schema) and all(required.values())
+    ev("FORM_SCHEMA_PROBE", "", ok=ok, fields=len(schema),
+       missing=",".join(k for k, v in required.items() if not v) or "(none)")
+
+    return {
+        "ok"                 : ok,
+        "schema_resolved"    : bool(schema),
+        "field_count"        : len(schema),
+        "required_form_fields": required,
+        "managed_fields"     : managed,
+        "all_field_keys"     : found,
+        "form_aware_enabled" : FORM_AWARE_ENABLED,
+        "note": ("ok=true means the contact-record path will resolve these "
+                 "fields once FORM_AWARE_ENABLED is set. Names only - no "
+                 "contact data is read or returned."),
+    }
+
+
 @app.get("/")
 async def root():
     """Render health check — must return 200 instantly."""

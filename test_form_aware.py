@@ -928,5 +928,77 @@ class Test21_FieldResolution(FormAwareTestCase):
         self.assertEqual(vals["f2"], ma.Q_UTILITY)
 
 
+class Test22_SchemaProbeEndpoint(FormAwareTestCase):
+    """The read-only pre-flight diagnostic. Must leak nothing and mutate nothing."""
+
+    class _Req:
+        def __init__(self, secret=None):
+            self.headers = {"X-Debug-Secret": secret} if secret else {}
+
+    def test_it_is_hard_disabled_without_a_secret(self):
+        real = ma.DEBUG_RESET_SECRET
+        ma.DEBUG_RESET_SECRET = ""
+        try:
+            r = run(ma.debug_form_schema(self._Req()))
+            self.assertEqual(r.status_code, 503)
+        finally:
+            ma.DEBUG_RESET_SECRET = real
+
+    def test_a_wrong_secret_is_401(self):
+        real = ma.DEBUG_RESET_SECRET
+        ma.DEBUG_RESET_SECRET = "right"
+        try:
+            r = run(ma.debug_form_schema(self._Req("wrong")))
+            self.assertEqual(r.status_code, 401)
+        finally:
+            ma.DEBUG_RESET_SECRET = real
+
+    def _probe(self, schema):
+        async def _s(force=False):
+            return schema
+        ma.fetch_ghl_custom_field_schema = _s
+        real = ma.DEBUG_RESET_SECRET
+        ma.DEBUG_RESET_SECRET = "s3cret"
+        try:
+            return run(ma.debug_form_schema(self._Req("s3cret")))
+        finally:
+            ma.DEBUG_RESET_SECRET = real
+
+    def test_ok_when_all_three_form_fields_are_present(self):
+        r = self._probe({"a": "homeowner_status", "b": "utility_provider",
+                         "c": "avg_monthly_bill", "d": "qualification_status"})
+        self.assertTrue(r["ok"])
+        self.assertTrue(all(r["required_form_fields"].values()))
+        self.assertTrue(r["managed_fields"]["qualification_status"])
+
+    def test_not_ok_when_a_required_field_is_missing(self):
+        r = self._probe({"a": "homeowner_status", "b": "utility_provider"})
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["required_form_fields"]["avg_monthly_bill"])
+
+    def test_not_ok_when_the_schema_does_not_resolve(self):
+        r = self._probe({})
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["schema_resolved"])
+
+    def test_it_reports_the_flag_state(self):
+        ma.FORM_AWARE_ENABLED = False
+        r = self._probe({"a": "homeowner_status", "b": "utility_provider",
+                         "c": "avg_monthly_bill"})
+        self.assertFalse(r["form_aware_enabled"])
+
+    def test_it_returns_names_only_and_no_contact_data(self):
+        r = self._probe({"a": "homeowner_status", "b": "utility_provider",
+                         "c": "avg_monthly_bill"})
+        blob = str(r).lower()
+        for leak in ("phone", "email", "+1", "address", "firstname", "value"):
+            self.assertNotIn(leak, blob, f"probe leaked {leak!r}")
+
+    def test_the_probe_does_not_mutate_state(self):
+        before = dict(ma._state_store)
+        self._probe({"a": "homeowner_status"})
+        self.assertEqual(ma._state_store, before)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
