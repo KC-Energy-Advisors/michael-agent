@@ -10697,8 +10697,19 @@ async def health():
     these counters are process-local and reset on restart. A stuck queue
     shows as: window open, holds_placed > 0, resumes_processed == 0.
     No names, phone numbers, emails or message bodies are returned.
+
+    `build` answers the two questions a deploy raises: WHICH commit is
+    actually running, and is the form-aware feature dark? Render injects
+    RENDER_GIT_COMMIT / RENDER_GIT_BRANCH automatically, so there is nothing
+    to configure. Read-only and additive - no contact data, no secrets.
     """
     return {
+        "build": {
+            "commit"    : os.getenv("RENDER_GIT_COMMIT", "")[:7] or "unknown",
+            "branch"    : os.getenv("RENDER_GIT_BRANCH", "") or "unknown",
+            "form_aware": FORM_AWARE_ENABLED,
+            "bill_threshold": BILL_THRESHOLD,
+        },
         "status"      : "ok",
         "send_window" : send_window_status(),
         "after_hours" : {
