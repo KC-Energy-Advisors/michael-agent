@@ -2437,9 +2437,24 @@ QUAL_YES     = "yes"
 QUAL_NO      = "no"
 UTIL_AMEREN  = "ameren"
 UTIL_OTHER   = "other"
+# [FORM-AWARE] A fourth utility state: the homeowner has told us they are NOT
+# on Ameren Missouri, but we do not yet know WHO they are on. This is NOT a
+# disqualification — several Missouri providers may be serviceable, and that
+# determination belongs to UTILITY_ELIGIBILITY below, never to Claude.
+#
+# It reads as "still missing" to qualification_verdict() because it is not
+# UTIL_AMEREN, and it does NOT disqualify because it is not UTIL_OTHER. That
+# falls out of the existing verdict logic with no change to it.
+UTIL_PENDING = "pending"
 
 # The threshold the offer is built around. Below it, the math does not work.
-BILL_THRESHOLD = 100
+# Overridable so the policy can move without a code change; a non-numeric or
+# absent value keeps the historical 100.
+try:
+    BILL_THRESHOLD = int(os.getenv("QUALIFY_BILL_THRESHOLD", "100"))
+except (TypeError, ValueError):
+    log.warning("QUALIFY_BILL_THRESHOLD is not an integer - falling back to 100")
+    BILL_THRESHOLD = 100
 
 VERDICT_QUALIFIED    = "qualified"
 VERDICT_DISQUALIFIED = "disqualified"
@@ -2449,6 +2464,243 @@ VERDICT_INCOMPLETE   = "incomplete"
 Q_HOMEOWNER = "homeowner"
 Q_UTILITY   = "utility"
 Q_BILL      = "bill_100_plus"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  [FORM-AWARE] META INSTANT FORM → QUALIFICATION POLICY
+#
+#  THE ONE PLACE to change what the Meta form answers mean. Nothing in this
+#  block contains business logic: it is a translation table from the exact
+#  strings the form emits into the tri-state record that already exists.
+#  The verdict is still computed by qualification_verdict(), the facts are
+#  still written by apply_qualification_facts(). No parallel engine.
+#
+#  Feature flag. Default OFF so a deploy is inert until it is switched on.
+# ═══════════════════════════════════════════════════════════════════════
+FORM_AWARE_ENABLED = str(
+    os.getenv("FORM_AWARE_ENABLED", "false")
+).strip().lower() in ("1", "true", "yes", "on")
+
+# GHL custom-field keys, exactly as confirmed in production. Matching is done
+# on the trailing segment, case-insensitively, so "contact.homeowner_status",
+# "homeowner_status" and "Homeowner Status" all resolve to the same field.
+FORM_FIELD_HOMEOWNER = "homeowner_status"
+FORM_FIELD_UTILITY   = "utility_provider"
+FORM_FIELD_BILL      = "avg_monthly_bill"
+
+# System-managed fields Python owns. Claude never writes these.
+FORM_FIELD_QUAL_STATUS  = "qualification_status"
+FORM_FIELD_QUAL_MISSING = "qualification_missing"
+FORM_FIELD_SEEN_AT      = "form_answers_seen_at"
+
+# ── Answer tables ────────────────────────────────────────────────────────
+# Keys are normalised (lowercased, collapsed whitespace, punctuation-lenient)
+# before lookup, so "Yes", "yes " and "YES" all hit the same entry.
+FORM_HOMEOWNER_VALUES: dict[str, str] = {
+    "yes": QUAL_YES,
+    "no" : QUAL_NO,
+}
+
+# Every bucket sits wholly on one side of BILL_THRESHOLD. A bucket that
+# straddled it could not resolve to yes or no and would force a re-ask,
+# which is the whole thing this feature exists to prevent.
+FORM_BILL_BUCKETS: dict[str, tuple[str, int]] = {
+    "under $100": (QUAL_NO,  0),
+    "$100-$149" : (QUAL_YES, 100),
+    "$150-$199" : (QUAL_YES, 150),
+    "$200-$299" : (QUAL_YES, 200),
+    "$300+"     : (QUAL_YES, 300),
+}
+
+# The utility answers the form itself offers.
+#   Ameren Missouri        -> the qualifying provider
+#   Ameren Illinois        -> a different utility, out of the Missouri campaign
+#   Another electric provider -> we do not know who yet. PENDING, never a
+#                            disqualification: the provider must be named and
+#                            checked against UTILITY_ELIGIBILITY first.
+FORM_UTILITY_VALUES: dict[str, str] = {
+    "ameren missouri"         : UTIL_AMEREN,
+    "ameren illinois"         : UTIL_OTHER,
+    "another electric provider": UTIL_PENDING,
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  [FORM-AWARE] UTILITY ELIGIBILITY REGISTER
+#
+#  The authoritative, maintained answer to "does this provider's current
+#  net-metering / interconnection arrangement satisfy our offering?".
+#
+#  READ THIS BEFORE EDITING:
+#    * Claude NEVER decides eligibility. It cannot see this table and has no
+#      authority to assert that a provider does or does not qualify. It only
+#      asks the homeowner who their provider is; classification happens here.
+#    * There is deliberately NO live web lookup. The agent has no approved
+#      research mechanism, and inventing utility policy mid-SMS is exactly
+#      the failure mode this register prevents.
+#    * A provider that is not listed is UNVERIFIED, which means PENDING.
+#      Unverified is NOT a synonym for ineligible. It means "a human has not
+#      checked this one yet", and the lead waits rather than being wrongly
+#      qualified or wrongly binned.
+#
+#  PROVENANCE OF THE SEED DATA:
+#    ELIGIBLE and INELIGIBLE below carry over the classifications this
+#    codebase already made in the pre-existing _UTIL_OTHER_RE regex and the
+#    confirmed Missouri-only service area. They are this business's existing
+#    decisions relocated into one editable place - NOT new net-metering
+#    research, which would be exactly the hallucination we are avoiding.
+#    Verify each entry against the current tariff before relying on it.
+#
+#  TO ADD A PROVIDER: confirm its current net-metering terms, then put its
+#  name in the right set. Nothing else in the codebase needs to change.
+# ═══════════════════════════════════════════════════════════════════════
+
+# Verified to satisfy the service-eligibility criteria.
+UTILITY_ELIGIBLE: dict[str, str] = {
+    "ameren missouri": "Ameren Missouri",
+    "ameren mo"      : "Ameren Missouri",
+    "ameren ue"      : "Ameren Missouri",
+    "union electric" : "Ameren Missouri",
+}
+
+# Verified NOT serviceable. Carried over from _UTIL_OTHER_RE and the
+# Missouri-only service area; re-verify before treating as permanent.
+UTILITY_INELIGIBLE: dict[str, str] = {
+    "ameren illinois"        : "out of state - Missouri campaign only",
+    "ameren il"              : "out of state - Missouri campaign only",
+    "cuivre river"           : "cooperative - carried over from prior config",
+    "cuivre river electric"  : "cooperative - carried over from prior config",
+    "citizens electric"      : "carried over from prior config",
+    "evergy"                 : "carried over from prior config",
+    "evergy missouri west"   : "carried over from prior config",
+    "evergy metro"           : "carried over from prior config",
+    "kcpl"                   : "carried over from prior config",
+    "kcp&l"                  : "carried over from prior config",
+    "empire district"        : "carried over from prior config",
+    "spire"                  : "gas utility - not an electric provider",
+    "laclede"                : "gas utility - not an electric provider",
+    "laclede gas"            : "gas utility - not an electric provider",
+}
+
+UTIL_ELIGIBILITY_ELIGIBLE   = "eligible"
+UTIL_ELIGIBILITY_INELIGIBLE = "ineligible"
+UTIL_ELIGIBILITY_UNVERIFIED = "unverified"
+
+
+def _normalize_answer(value: str) -> str:
+    """Lowercase, collapse whitespace, strip trailing punctuation."""
+    t = str(value or "").strip().lower()
+    t = re.sub(r"\s+", " ", t)
+    t = t.replace("–", "-").replace("—", "-")   # en/em dash -> hyphen
+    t = re.sub(r"[.!?,;:]+$", "", t)
+    return t.strip()
+
+
+def classify_utility_name(name: str) -> tuple[str, str]:
+    """
+    (eligibility, canonical_name) for a provider the homeowner named.
+
+    eligibility is one of UTIL_ELIGIBILITY_*. UNVERIFIED is the safe default
+    for anything not in the register - it keeps the lead PENDING rather than
+    guessing in either direction.
+    """
+    n = _normalize_answer(name)
+    if not n:
+        return UTIL_ELIGIBILITY_UNVERIFIED, ""
+
+    n = re.sub(r"\b(electric|energy|power|utility|utilities|company|co|coop|"
+               r"co-op|cooperative|inc|llc)\b", " ", n)
+    n = re.sub(r"\s+", " ", n).strip()
+
+    for table, verdict in ((UTILITY_ELIGIBLE, UTIL_ELIGIBILITY_ELIGIBLE),
+                           (UTILITY_INELIGIBLE, UTIL_ELIGIBILITY_INELIGIBLE)):
+        for key, canonical in table.items():
+            k = re.sub(r"\b(electric|energy|power|utility|utilities|company|co|"
+                       r"coop|co-op|cooperative|inc|llc)\b", " ", key)
+            k = re.sub(r"\s+", " ", k).strip()
+            if k and (n == k or k in n):
+                return verdict, canonical
+    return UTIL_ELIGIBILITY_UNVERIFIED, str(name or "").strip()
+
+
+def utility_state_for_name(name: str) -> Optional[str]:
+    """
+    q_utility value implied by a named provider, or None when the name is
+    empty. An UNVERIFIED provider yields UTIL_PENDING - never a silent pass
+    and never a silent rejection.
+    """
+    verdict, _canonical = classify_utility_name(name)
+    if not str(name or "").strip():
+        return None
+    if verdict == UTIL_ELIGIBILITY_ELIGIBLE:
+        return UTIL_AMEREN
+    if verdict == UTIL_ELIGIBILITY_INELIGIBLE:
+        return UTIL_OTHER
+    return UTIL_PENDING
+
+
+def _match_form_field(custom_fields: dict, wanted_key: str) -> str:
+    """
+    Value for a GHL custom field, matched on the trailing key segment.
+
+    Tolerates "contact.homeowner_status", "homeowner_status" and
+    "Homeowner Status" because GHL surfaces the key differently depending on
+    whether the data came from a webhook payload or the contact record.
+    """
+    want = wanted_key.strip().lower()
+    for key, value in (custom_fields or {}).items():
+        k = str(key).strip().lower()
+        tail = k.rsplit(".", 1)[-1]
+        if tail == want or k == want or tail.replace(" ", "_") == want:
+            return str(value or "").strip()
+    return ""
+
+
+def facts_from_form_fields(custom_fields: dict) -> dict:
+    """
+    Meta Instant Form answers -> a facts dict in the exact shape
+    apply_qualification_facts() already consumes.
+
+    _source="form" is the LOWEST precedence tier. Form answers may fill an
+    UNKNOWN, but apply_qualification_facts() will not let them overwrite an
+    answer already on record, and an explicit statement from the homeowner
+    always beats them. That is what makes "Actually I rent" work.
+    """
+    facts: dict = {}
+    if not custom_fields:
+        return facts
+
+    raw_home = _match_form_field(custom_fields, FORM_FIELD_HOMEOWNER)
+    if raw_home:
+        mapped = FORM_HOMEOWNER_VALUES.get(_normalize_answer(raw_home))
+        if mapped:
+            facts[Q_HOMEOWNER] = mapped
+
+    raw_bill = _match_form_field(custom_fields, FORM_FIELD_BILL)
+    if raw_bill:
+        norm = _normalize_answer(raw_bill).replace(" ", "")
+        for bucket, (verdict, floor) in FORM_BILL_BUCKETS.items():
+            if _normalize_answer(bucket).replace(" ", "") == norm:
+                facts[Q_BILL] = verdict
+                if floor:
+                    facts["bill_amount"] = f"${floor}/month"
+                facts["bill_bucket"] = bucket
+                break
+
+    raw_util = _match_form_field(custom_fields, FORM_FIELD_UTILITY)
+    if raw_util:
+        mapped = FORM_UTILITY_VALUES.get(_normalize_answer(raw_util))
+        if mapped is None:
+            # Not one of the three form options - treat it as a named
+            # provider and let the register decide.
+            mapped = utility_state_for_name(raw_util)
+        if mapped:
+            facts[Q_UTILITY] = mapped
+            facts["utility_raw"] = raw_util
+
+    if facts:
+        facts["_source"] = "form"
+    return facts
 
 
 # ── Ownership, stated explicitly ─────────────────────────────────────────
@@ -2475,13 +2727,36 @@ _UTIL_AMEREN_IL_RE = re.compile(r"ameren\s+(?:il\b|illinois)", re.IGNORECASE)
 _UTIL_AMEREN_RE    = re.compile(r"\bameren\b", re.IGNORECASE)
 
 # Named non-Ameren providers seen around the St. Louis metro, plus the
-# generic co-op phrasing. Any of these disqualifies on utility.
+# generic co-op phrasing. Retained for backward compatibility and still the
+# union of both patterns below, so any caller reading it sees what it always
+# saw. _detect_utility() no longer treats a match here as an automatic
+# disqualification - see the two patterns that follow.
 _UTIL_OTHER_RE = re.compile(
     r"\b(cuivre\s*river|evergy|spire|citizens\s+electric|rural\s+electric"
     r"|electric\s+co-?op|co-?operative|kcp&?l|empire\s+district"
     r"|missouri\s+rural|lacle?de)\b"
     r"|\bnot\s+(?:with\s+|on\s+)?ameren\b"
     r"|\bdon'?t\s+have\s+ameren\b",
+    re.IGNORECASE,
+)
+
+# [FORM-AWARE] A provider named outright. The NAME is extracted here; the
+# VERDICT comes from UTILITY_ELIGIBILITY, never from this regex. That is what
+# lets an entry be re-classified by editing the register alone.
+_UTIL_NAMED_RE = re.compile(
+    r"\b(cuivre\s*river|evergy\s+missouri\s+west|evergy\s+metro|evergy"
+    r"|citizens\s+electric|kcp&?l|empire\s+district|spire|lacle?de)\b",
+    re.IGNORECASE,
+)
+
+# [FORM-AWARE] "It isn't Ameren" without saying who it IS. This is PENDING:
+# we know enough to stop assuming Ameren, and not enough to decide anything.
+# A co-op or rural provider named only generically lands here too - which
+# one it is determines eligibility, so it must be asked.
+_UTIL_NOT_AMEREN_GENERIC_RE = re.compile(
+    r"\bnot\s+(?:with\s+|on\s+)?ameren\b"
+    r"|\bdon'?t\s+have\s+ameren\b"
+    r"|\b(?:rural\s+electric|electric\s+co-?op|co-?operative|missouri\s+rural)\b",
     re.IGNORECASE,
 )
 
@@ -2521,10 +2796,29 @@ def _detect_ownership(text: str) -> Optional[str]:
 
 
 def _detect_utility(text: str) -> Optional[str]:
-    """UTIL_AMEREN / UTIL_OTHER from an explicit statement, else None."""
+    """
+    UTIL_AMEREN / UTIL_OTHER / UTIL_PENDING from an explicit statement,
+    else None.
+
+    [FORM-AWARE] A named provider is looked up in UTILITY_ELIGIBILITY rather
+    than being disqualified by pattern match, so re-classifying one is a
+    config edit. A provider we cannot identify yields UTIL_PENDING - it is
+    neither qualified nor binned until a human has verified it.
+    """
     t = text or ""
-    if _UTIL_AMEREN_IL_RE.search(t) or _UTIL_OTHER_RE.search(t):
+    # Ameren Illinois is matched before the bare "ameren" test: different
+    # utility, different state, and the campaign is Missouri only.
+    if _UTIL_AMEREN_IL_RE.search(t):
         return UTIL_OTHER
+
+    _named = _UTIL_NAMED_RE.search(t)
+    if _named:
+        return utility_state_for_name(_named.group(0))
+
+    # They have ruled Ameren out without naming a replacement.
+    if _UTIL_NOT_AMEREN_GENERIC_RE.search(t):
+        return UTIL_PENDING
+
     if _UTIL_AMEREN_RE.search(t):
         return UTIL_AMEREN
     return None
@@ -2643,7 +2937,8 @@ def is_blanket_confirmation(text: str) -> bool:
 
 
 def extract_qualification_facts(text: str,
-                                previous_outbound_type: str = "unknown") -> dict:
+                                previous_outbound_type: str = "unknown",
+                                utility_pending: bool = False) -> dict:
     """
     Facts this inbound message establishes, as {field: value}. Only fields the
     message genuinely settles appear; everything else is simply absent.
@@ -2699,6 +2994,18 @@ def extract_qualification_facts(text: str,
         facts["_source"]   = "explicit"
         if bill_amount:
             facts["bill_amount"] = bill_amount
+
+    # [FORM-AWARE] We asked "who is your provider?" because the utility is
+    # PENDING. A reply that is not a bare yes and names no known pattern is
+    # very likely the provider's name, so hand the whole thing to the
+    # register. An unrecognised name stays PENDING - it never silently
+    # qualifies and never silently disqualifies.
+    if utility_pending and Q_UTILITY not in facts and not bare:
+        _named_state = utility_state_for_name(t)
+        if _named_state:
+            facts[Q_UTILITY]     = _named_state
+            facts["utility_raw"] = t[:120]
+            facts["_source"]     = "explicit"
 
     return facts
 
@@ -2780,7 +3087,11 @@ def sync_qualification_fields(state: dict) -> None:
         for field, value in (("q_homeowner", QUAL_YES),
                              ("q_utility", UTIL_AMEREN),
                              ("q_bill_100_plus", QUAL_YES)):
-            if state.get(field, QUAL_UNKNOWN) == QUAL_UNKNOWN:
+            _cur = state.get(field, QUAL_UNKNOWN)
+            # [FORM-AWARE] PENDING is an open question, not an answer, so a
+            # booked contact closes it the same way UNKNOWN is closed. Without
+            # this a booked lead would still read as "missing utility".
+            if _cur == QUAL_UNKNOWN or (field == "q_utility" and _cur == UTIL_PENDING):
                 state[field] = value
 
     # ── record → legacy ──
@@ -3520,6 +3831,20 @@ def build_system_prompt(state: dict, ghl_pipeline_stage: str = "", ghl_tags: lis
         confirmed.append("✓ UTILITY: Ameren Missouri confirmed — do NOT ask about their electric provider again")
     elif _q_util == UTIL_OTHER:
         confirmed.append("✗ UTILITY: not Ameren Missouri — disqualify if not already done")
+    elif _q_util == UTIL_PENDING:
+        # [FORM-AWARE] They have told us it is not Ameren. Asking "are you
+        # with Ameren?" would ignore what they already said. We need the NAME
+        # so the backend can check it — Claude must not judge eligibility.
+        _named = str(state.get("utility_named") or "").strip()
+        confirmed.append(
+            "◐ UTILITY: they have said they are NOT on Ameren Missouri"
+            + (f" (they mentioned: {_named})" if _named else "")
+            + " — do NOT ask whether they are on Ameren. We still need the NAME of "
+              "their provider. Ask plainly, e.g. \"who's your electric provider?\". "
+              "Do NOT tell them whether their provider qualifies, do NOT mention "
+              "net metering, buyback rates or interconnection, and do NOT guess — "
+              "we verify it on our side after they answer."
+        )
     elif stage in (Stage.SEND_BOOKING, Stage.BOOKED):
         confirmed.append("✓ UTILITY: confirmed — do NOT ask about their electric provider again")
 
@@ -3586,6 +3911,13 @@ def build_system_prompt(state: dict, ghl_pipeline_stage: str = "", ghl_tags: lis
         )
     elif _ask_one in _MISSING_FIELD_GUIDANCE:
         _label, _how = _MISSING_FIELD_GUIDANCE[_ask_one]
+        # [FORM-AWARE] A PENDING utility needs the provider's NAME, not a
+        # yes/no on Ameren they have already answered.
+        if _ask_one == Q_UTILITY and _q_util == UTIL_PENDING:
+            _how = ("get the NAME of their electric provider — they have already "
+                    "said it is not Ameren. One short, casual question, e.g. "
+                    "\"Gotcha — who's your electric provider?\". Do NOT say whether "
+                    "it qualifies and do NOT mention net metering or buyback rates.")
         current_goal = (
             f"ASK {_label.upper()} — this is the ONLY thing still unknown. {_how} "
             f"Ask it and nothing else. Everything under WHAT YOU ALREADY KNOW is settled: "
@@ -4282,6 +4614,93 @@ def classify_sms_failure(dnd_sms: dict | None = None,
 
 
 # ── Compliance state from GHL ─────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════
+#  [FORM-AWARE] GHL CUSTOM-FIELD SCHEMA CACHE
+#
+#  GET /contacts/{id} returns customFields as [{"id": "...", "value": "..."}]
+#  with NO field name. The names live on the location, so one cached lookup
+#  turns those opaque ids into the keys the policy table matches on. This is
+#  why the Meta workflow does NOT need custom data configured by hand.
+#
+#  Cached for the process lifetime: field definitions change when someone
+#  edits them in GHL, which is a deploy-scale event, not a per-request one.
+#  Every failure path returns {} and the caller degrades to whatever the
+#  webhook payload carried - it must never break a send.
+# ═══════════════════════════════════════════════════════════════════════
+_ghl_cf_schema: dict[str, str] = {}      # field id -> lowercase key tail
+_ghl_cf_schema_loaded: bool = False
+
+
+async def fetch_ghl_custom_field_schema(force: bool = False) -> dict:
+    """{field_id: key_tail} for the location's contact custom fields."""
+    global _ghl_cf_schema, _ghl_cf_schema_loaded
+    if _ghl_cf_schema_loaded and not force:
+        return _ghl_cf_schema
+    if not (GHL_API_KEY and GHL_LOCATION_ID):
+        return {}
+    url = f"{GHL_API_BASE}/locations/{GHL_LOCATION_ID}/customFields"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(url, headers=_ghl_headers(_GHL_HEADERS_V2))
+        if not r.is_success:
+            ev("CF_SCHEMA_LOOKUP_FAILED", "", http=r.status_code)
+            return {}
+        data = r.json() or {}
+        items = data.get("customFields") or data.get("customValues") or []
+        schema: dict[str, str] = {}
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            fid = str(item.get("id") or "").strip()
+            key = str(item.get("fieldKey") or item.get("key")
+                      or item.get("name") or "").strip().lower()
+            if fid and key:
+                schema[fid] = key.rsplit(".", 1)[-1].replace(" ", "_")
+        _ghl_cf_schema = schema
+        _ghl_cf_schema_loaded = True
+        ev("CF_SCHEMA_LOADED", "", fields=len(schema))
+        return schema
+    except Exception as err:
+        ev("CF_SCHEMA_LOOKUP_ERROR", "", error=str(err)[:120])
+        return {}
+
+
+def resolve_custom_fields(raw, schema: dict) -> dict:
+    """
+    GHL's customFields payload -> {key_tail: value}.
+
+    Accepts the id-keyed list the contact record returns and the name-keyed
+    shapes a workflow webhook can send. Unresolvable ids are kept under the
+    raw id so nothing is silently lost from the logs.
+    """
+    out: dict[str, str] = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            val = _safe_str(v)
+            if k and val:
+                out[str(k).strip().lower().rsplit(".", 1)[-1]] = val
+        return out
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        val = _safe_str(
+            item.get("value") if item.get("value") is not None
+            else item.get("fieldValue")
+        )
+        if not val:
+            continue
+        name = _safe_str(item.get("fieldKey") or item.get("name") or item.get("key"))
+        if not name:
+            name = (schema or {}).get(_safe_str(item.get("id")), "")
+        if not name:
+            name = _safe_str(item.get("id"))
+        if name:
+            out[name.strip().lower().rsplit(".", 1)[-1].replace(" ", "_")] = val
+    return out
+
+
 async def fetch_ghl_contact_compliance(contact_id: str) -> dict:
     """
     Fetch phone, email, tags AND compliance state in ONE call.
@@ -4289,10 +4708,15 @@ async def fetch_ghl_contact_compliance(contact_id: str) -> dict:
     GET /contacts/{id} already returns `dnd` and `dndSettings`.
     fetch_ghl_contact_phone() downloads that payload and throws the
     compliance fields away, which is why the agent has been blind to DND.
+
+    [FORM-AWARE] Also surfaces `custom_fields` and `address` from the SAME
+    response. No extra contact call, and the compliance contract is
+    unchanged: both keys default to empty on every existing failure path.
     """
     blank = {"ok": False, "first_name": "", "full_name": "", "phone": "",
              "email": "", "dnd": None, "dnd_sms": {}, "tags": [],
-             "date_added": "", "http": None}
+             "date_added": "", "http": None,
+             "custom_fields": {}, "address": ""}
     if not contact_id:
         return blank
     url = f"{GHL_API_BASE}/contacts/{contact_id}"
@@ -4311,6 +4735,24 @@ async def fetch_ghl_contact_compliance(contact_id: str) -> dict:
         _tags = contact.get("tags") or []
         _fn = str(contact.get("firstName") or contact.get("first_name") or "").strip()
         _ln = str(contact.get("lastName") or contact.get("last_name") or "").strip()
+
+        # [FORM-AWARE] Additive only. Any failure here leaves the compliance
+        # result exactly as it was before this feature existed.
+        _cf: dict = {}
+        _addr = ""
+        try:
+            _addr = str(contact.get("address1") or contact.get("address")
+                        or "").strip()
+            _raw_cf = contact.get("customFields")
+            if _raw_cf is None:
+                _raw_cf = contact.get("customField")
+            if _raw_cf and FORM_AWARE_ENABLED:
+                _schema = await fetch_ghl_custom_field_schema()
+                _cf = resolve_custom_fields(_raw_cf, _schema)
+        except Exception as _cf_err:
+            ev("CF_RESOLVE_ERROR", contact_id, error=str(_cf_err)[:120])
+            _cf = {}
+
         return {
             "ok"        : True,
             "first_name": _fn,
@@ -4323,10 +4765,171 @@ async def fetch_ghl_contact_compliance(contact_id: str) -> dict:
             "tags"      : list(_tags) if isinstance(_tags, list) else [],
             "date_added": contact.get("dateAdded") or contact.get("createdAt") or "",
             "http"      : r.status_code,
+            "custom_fields": _cf,
+            "address"      : _addr,
         }
     except Exception as err:
         ev("COMPLIANCE_LOOKUP_ERROR", contact_id, error=str(err)[:120])
         return blank
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  [FORM-AWARE] HYDRATION — GHL contact record -> qualification record
+#
+#  The durability answer. _state_store is process memory and dies with the
+#  dyno; the GHL contact record does not. Every path that can start or
+#  resume a conversation calls this, so a restart, an overnight hold or a
+#  brand-new lead all reconstruct the same facts from the same source.
+#
+#  It writes NOTHING that apply_qualification_facts() would not accept, and
+#  it sends no SMS. It cannot bypass a gate because it never reaches one.
+# ═══════════════════════════════════════════════════════════════════════
+
+async def hydrate_form_facts(contact_id: str,
+                             state: dict,
+                             body: dict | None = None,
+                             compliance: dict | None = None) -> dict:
+    """
+    Fill the qualification record from the Meta form answers on the GHL
+    contact. Returns a small report dict for logging; never raises.
+
+    Cheap by design: if every criterion is already settled in memory there
+    is nothing to learn, so no API call is made.
+    """
+    report = {"ran": False, "source": "", "applied": [], "verdict": "",
+              "missing": [], "reason": ""}
+    if not FORM_AWARE_ENABLED:
+        report["reason"] = "flag_off"
+        return report
+    if not contact_id:
+        report["reason"] = "no_contact_id"
+        return report
+
+    try:
+        # Already settled? PENDING counts as settled - the form has spoken
+        # and only the homeowner can move it now.
+        _unsettled = [
+            f for f in ("q_homeowner", "q_utility", "q_bill_100_plus")
+            if (state.get(f) or QUAL_UNKNOWN) == QUAL_UNKNOWN
+        ]
+        if not _unsettled:
+            report["reason"] = "already_hydrated"
+            return report
+
+        # 1. Anything the webhook already carried costs nothing to read.
+        cf: dict = {}
+        if body:
+            try:
+                cf = extract_custom_fields(body) or {}
+            except Exception:
+                cf = {}
+            if cf:
+                report["source"] = "webhook_payload"
+
+        # 2. Otherwise the contact record - the durable source of truth.
+        if not _match_form_field(cf, FORM_FIELD_HOMEOWNER) and \
+           not _match_form_field(cf, FORM_FIELD_UTILITY) and \
+           not _match_form_field(cf, FORM_FIELD_BILL):
+            c = compliance if isinstance(compliance, dict) and compliance.get("ok") \
+                else await fetch_ghl_contact_compliance(contact_id)
+            if c.get("ok"):
+                if c.get("custom_fields"):
+                    cf = {**cf, **c["custom_fields"]}
+                    report["source"] = "ghl_contact"
+                if c.get("address") and not state.get("address"):
+                    state["address"] = c["address"]
+            else:
+                report["reason"] = "contact_lookup_failed"
+
+        if not cf:
+            report["reason"] = report["reason"] or "no_custom_fields"
+            return report
+
+        # 3. Through the EXISTING machinery. No parallel engine.
+        facts = facts_from_form_fields(cf)
+        if not facts:
+            report["reason"] = "no_recognised_answers"
+            return report
+
+        _bucket = facts.pop("bill_bucket", "")
+        _util_raw = facts.pop("utility_raw", "")
+        applied = apply_qualification_facts(state, facts, contact_id)
+        sync_qualification_fields(state)
+
+        if _bucket and not state.get("bill_bucket"):
+            state["bill_bucket"] = _bucket
+        if _util_raw and not state.get("utility_named"):
+            state["utility_named"] = _util_raw
+        state["form_facts_loaded"] = True
+
+        verdict, missing = qualification_verdict(state)
+        report.update({"ran": True, "applied": applied,
+                       "verdict": verdict, "missing": missing})
+        ev("FORM_FACTS_HYDRATED", contact_id,
+           source=report["source"] or "none",
+           applied=",".join(applied) or "(none)",
+           homeowner=state.get("q_homeowner"),
+           utility=state.get("q_utility"),
+           bill_100_plus=state.get("q_bill_100_plus"),
+           bill_bucket=state.get("bill_bucket") or "(none)",
+           verdict=verdict,
+           missing=",".join(missing) or "(none)",
+           has_address=bool(state.get("address")))
+        save_state(contact_id, state)
+        return report
+    except Exception as err:
+        # Hydration is an enhancement. If it fails the agent must behave
+        # exactly as it did before this feature existed.
+        ev("FORM_FACTS_HYDRATE_ERROR", contact_id, error=str(err)[:140])
+        log.warning(f"[{contact_id}] form hydration failed (non-fatal): {err}")
+        report["reason"] = "exception"
+        return report
+
+
+async def sync_qualification_to_ghl(contact_id: str, state: dict) -> bool:
+    """
+    Mirror Python's deterministic verdict into the system-managed GHL fields.
+
+    Python owns this decision end to end - Claude's prose never reaches it.
+    Best-effort and non-fatal: a failed write is logged and ignored, because
+    the qualification record in GHL is a reporting surface, not the gate.
+    """
+    if not (FORM_AWARE_ENABLED and contact_id and GHL_API_KEY):
+        return False
+    try:
+        verdict, missing = qualification_verdict(state)
+        status = {VERDICT_QUALIFIED: "QUALIFIED",
+                  VERDICT_DISQUALIFIED: "UNQUALIFIED",
+                  VERDICT_INCOMPLETE: "PARTIAL"}.get(verdict, "UNKNOWN")
+        if verdict == VERDICT_INCOMPLETE and not state.get("form_facts_loaded"):
+            status = "UNKNOWN"
+
+        schema = await fetch_ghl_custom_field_schema()
+        if not schema:
+            return False
+        want = {
+            FORM_FIELD_QUAL_STATUS : status,
+            FORM_FIELD_QUAL_MISSING: ",".join(missing),
+            FORM_FIELD_SEEN_AT     : datetime.now(tz=CENTRAL_TZ).isoformat(
+                                         timespec="seconds"),
+        }
+        payload = [{"id": fid, "value": want[tail]}
+                   for fid, tail in schema.items() if tail in want]
+        if not payload:
+            ev("QUAL_SYNC_SKIPPED", contact_id, reason="fields_not_found_in_schema")
+            return False
+
+        url = f"{GHL_API_BASE}/contacts/{contact_id}"
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.put(url, json={"customFields": payload},
+                                 headers=_ghl_headers(_GHL_HEADERS_V2))
+        ok = r.is_success
+        ev("QUAL_SYNC_TO_GHL", contact_id, ok=ok, http=r.status_code,
+           status=status, missing=",".join(missing) or "(none)")
+        return ok
+    except Exception as err:
+        ev("QUAL_SYNC_ERROR", contact_id, error=str(err)[:120])
+        return False
 
 
 async def can_contact_sms(contact_id: str, state: dict | None = None) -> dict:
@@ -5032,12 +5635,48 @@ Current GHL pipeline stage: {ghl_pipeline_stage or "Solar Savings Report Schedul
 #  Subsequent replies go through michael_agent().
 # ─────────────────────────────────────────────
 
+_STREET_SUFFIXES = (
+    "st", "street", "ave", "avenue", "rd", "road", "dr", "drive", "ln", "lane",
+    "ct", "court", "blvd", "boulevard", "way", "pl", "place", "ter", "terrace",
+    "cir", "circle", "trl", "trail", "pkwy", "parkway", "hwy",
+)
+
+
+def street_hint(address: str) -> str:
+    """
+    A natural, non-creepy reference to the property: "Oak" from
+    "1423 Oak Street, Chesterfield MO 63017".
+
+    Deliberately drops the house number and everything after the street, so
+    Michael can say "the home on Oak" without reading a database entry back
+    at somebody. Returns "" when nothing clean can be extracted.
+    """
+    raw = str(address or "").split(",")[0].strip()
+    if not raw:
+        return ""
+    parts = [p for p in re.split(r"\s+", raw) if p]
+    # Drop a leading house number ("1423", "1423B").
+    if parts and re.match(r"^\d+[A-Za-z]?$", parts[0]):
+        parts = parts[1:]
+    # Drop a trailing street-type suffix and any unit designator.
+    while parts and re.sub(r"[.]", "", parts[-1]).lower() in _STREET_SUFFIXES:
+        parts = parts[:-1]
+    name = " ".join(parts).strip(" .,#")
+    if not name or len(name) > 28 or not re.search(r"[A-Za-z]", name):
+        return ""
+    # Avoid directional-only fragments like "N" or "SW".
+    if len(name) <= 2:
+        return ""
+    return name.title()
+
+
 def build_new_contact_outreach(
     first_name:  str = "",
     full_name:   str = "",
     address:     str = "",
     lead_source: str = "",
     tags:        list | None = None,
+    state:       dict | None = None,
 ) -> str:
     """
     First proactive SMS sent to a new chat-widget / form lead.
@@ -5061,6 +5700,57 @@ def build_new_contact_outreach(
        Quick question: are you on Ameren Missouri for electric?"
     """
     first = _resolve_first_name(first_name, full_name)
+
+    # ── [FORM-AWARE] Form-aware opener ───────────────────────────────
+    # When the Meta form already answered a criterion, the opener must not
+    # ask it again. This branch only engages when the flag is on AND a state
+    # with loaded form facts is supplied; every other caller falls through to
+    # the historical copy below, byte for byte.
+    if FORM_AWARE_ENABLED and isinstance(state, dict) and state.get("form_facts_loaded"):
+        greeting  = f"Hey {first}," if first else "Hey,"
+        _verdict, _missing = qualification_verdict(state)
+        _street   = street_hint(state.get("address") or address)
+        _place    = f" for the home on {_street}" if _street else ""
+        _got_it   = (
+            f"{greeting} Michael here with STL Energy Advisors. "
+            f"I just got your request{_place}."
+        )
+
+        if _verdict == VERDICT_QUALIFIED:
+            # Everything we need is already known. Do NOT re-ask any of it.
+            return (
+                f"{_got_it}\n"
+                f"Looks like your place is worth a proper look — I can run "
+                f"the numbers and show you what the savings actually come out "
+                f"to. Want me to put that together?"
+            )
+
+        if _missing == [Q_UTILITY] and state.get("q_utility") == UTIL_PENDING:
+            # They already told the form it is not Ameren. Asking "are you
+            # with Ameren?" would ignore what they said. Get the name.
+            return f"{_got_it}\nQuick one so I can check the right rates — "\
+                   f"who's your electric provider?"
+
+        if _missing == [Q_UTILITY]:
+            return f"{_got_it}\nQuick question: are you on Ameren Missouri "\
+                   f"for electric?"
+
+        if _missing == [Q_BILL]:
+            return f"{_got_it}\nWhat's your electric bill running most months?"
+
+        if _missing == [Q_HOMEOWNER]:
+            return f"{_got_it}\nQuick question — are you the homeowner?"
+
+        if _verdict == VERDICT_DISQUALIFIED:
+            # The form already told us they are out - a renter, a sub-$100
+            # bill, or Ameren Illinois. Before form-awareness this case could
+            # not exist at first contact, so the historical copy below would
+            # ask a renter whether they are on Ameren. Return NOTHING; every
+            # call site treats an empty opener as "do not send".
+            return ""
+
+        # Two or more still unknown. Fall through to the standard copy below,
+        # which states the criteria together rather than asking one at a time.
 
     # ── [META-B1] Meta/paid-social variant ───────────────────────────
     # A Meta Instant Form is two taps on prefilled fields, so recall is
@@ -5271,6 +5961,16 @@ def michael_agent(contact_id: str, inbound_text: str, ghl_pipeline_stage: str = 
             if _tag_facts.get("location_confirmed") and not state.get("location_confirmed"):
                 state["location_confirmed"] = True
                 print(f"[AGENT] 🏷  location_confirmed from tag", flush=True)
+            # [FORM-AWARE / BUGFIX] parse_qualification_tags() has always
+            # returned a "utility" value, and no caller ever read it. An
+            # `ameren-confirmed` tag therefore restored location_confirmed but
+            # left q_utility UNKNOWN, so a contact whose state was wiped got
+            # asked for a utility GHL already had on record. Fills only when
+            # the record is UNKNOWN, so nothing the homeowner said is touched.
+            if _tag_facts.get("utility") and \
+                    (state.get("q_utility") or QUAL_UNKNOWN) == QUAL_UNKNOWN:
+                state["q_utility"] = _tag_facts["utility"]
+                print(f"[AGENT] 🏷  q_utility from tag: {_tag_facts['utility']}", flush=True)
             for _tf_key in ("bill_range", "roof_type", "timeline"):
                 if _tag_facts.get(_tf_key) and not state.get(_tf_key):
                     state[_tf_key] = _tag_facts[_tf_key]
@@ -5493,7 +6193,13 @@ def michael_agent(contact_id: str, inbound_text: str, ghl_pipeline_stage: str = 
         # the legacy parser just learned, the second pushes the record back
         # out to the fields tags and stage-restore read.
         sync_qualification_fields(state)
-        _facts = extract_qualification_facts(inbound_text, previous_outbound_type=_prev_type)
+        # [FORM-AWARE] When the utility is PENDING we have already asked who
+        # the provider is, so an unrecognised reply is read as the name.
+        _facts = extract_qualification_facts(
+            inbound_text,
+            previous_outbound_type=_prev_type,
+            utility_pending=(state.get("q_utility") == UTIL_PENDING),
+        )
         apply_qualification_facts(state, _facts, contact_id)
         sync_qualification_fields(state)
         _verdict, _missing = qualification_verdict(state)
@@ -7200,6 +7906,56 @@ async def inbound_webhook(request: Request):
                 ev("DNC_RESTORED_FROM_TAG", contact_id, tag=TAG_DNC)
 
         # ══════════════════════════════════════════════════════════════
+        #  [FORM-AWARE] META FORM FACT HYDRATION — before ALL routing
+        #
+        #  Placed here, after contact resolution and the processing lock and
+        #  before every routing branch, so ONE call serves the new-lead path,
+        #  the chat-widget path and the SMS-reply path. michael_agent() is
+        #  synchronous and cannot fetch, so the facts must be in state before
+        #  it is called.
+        #
+        #  Runs after the DNC restore on purpose: an opted-out contact is
+        #  already terminal and needs no enrichment.
+        #
+        #  Sends nothing. Touches no gate. Inert when FORM_AWARE_ENABLED is
+        #  off, and non-fatal in every failure mode.
+        # ══════════════════════════════════════════════════════════════
+        if FORM_AWARE_ENABLED and get_state(contact_id).get("stage") != Stage.DNC:
+            _fa_state  = get_state(contact_id)
+            _fa_report = await hydrate_form_facts(contact_id, _fa_state, body=body)
+            if _fa_report.get("ran"):
+                save_state(contact_id, _fa_state)
+                print(
+                    f"[FORM] hydrated | src={_fa_report['source']} | "
+                    f"applied={_fa_report['applied']} | "
+                    f"verdict={_fa_report['verdict']} | "
+                    f"missing={_fa_report['missing']}",
+                    flush=True,
+                )
+                # [FORM-AWARE] The form can disqualify a lead BEFORE first
+                # contact - a renter, a sub-threshold bill, Ameren Illinois.
+                # Mark it durably so GHL nurture gates on it and Michael never
+                # opens with a qualification question they already answered.
+                # Only from a pre-conversation stage: a BOOKED, DNC or engaged
+                # contact is never walked backwards by form data.
+                if (_fa_report.get("verdict") == VERDICT_DISQUALIFIED
+                        and _fa_state.get("stage") == Stage.INITIAL):
+                    _fa_state["stage"] = Stage.DISQUALIFIED
+                    save_state(contact_id, _fa_state)
+                    ev("FORM_DISQUALIFIED", contact_id,
+                       qualification=qualification_summary(_fa_state))
+                    try:
+                        await add_ghl_tags(
+                            contact_id, resolve_ghl_tags(Stage.DISQUALIFIED))
+                    except Exception as _dq_err:
+                        log.warning(f"[{contact_id}] disqualify tag write "
+                                    f"failed (non-fatal): {_dq_err}")
+                try:
+                    await sync_qualification_to_ghl(contact_id, _fa_state)
+                except Exception as _qs_err:
+                    log.warning(f"[{contact_id}] qual sync failed (non-fatal): {_qs_err}")
+
+        # ══════════════════════════════════════════════════════════════
         #  [META-B1] ENGAGEMENT MARKER  — cancels pending GHL nurture
         #
         #  Written on ANY real inbound message, including STOP.  The GHL
@@ -8274,8 +9030,20 @@ async def inbound_webhook(request: Request):
                     address=address,
                     lead_source=lead_source,
                     tags=tags,
+                    state=state,              # [FORM-AWARE] skip known answers
                 )
                 print(f"[ROUTING] First-outreach: {outreach!r}")
+                # [FORM-AWARE] Empty opener = the form already disqualified
+                # them. Send nothing; the DISQUALIFIED stage + tags written at
+                # hydration keep them out of nurture.
+                if not outreach:
+                    ev("FIRST_OUTREACH_SUPPRESSED", contact_id,
+                       reason="form_disqualified",
+                       qualification=qualification_summary(state))
+                    return JSONResponse({"status": "success", "skipped": True,
+                                         "reason": "form_disqualified",
+                                         "contact_id": contact_id})
+
 
                 # Race-fix: advance stage + store history BEFORE the async send.
                 # [DELIVERY] Snapshot first so the advance is reversible when the
@@ -8530,8 +9298,17 @@ async def inbound_webhook(request: Request):
                 address=address,
                 lead_source=lead_source,
                 tags=tags,
+                state=state,                  # [FORM-AWARE] skip known answers
             )
             print(f"[ROUTING] First-outreach (chat_widget real msg): {outreach!r}")
+            # [FORM-AWARE] See the form_disqualified guard above.
+            if not outreach:
+                ev("FIRST_OUTREACH_SUPPRESSED", contact_id,
+                   reason="form_disqualified",
+                   qualification=qualification_summary(state))
+                return JSONResponse({"status": "success", "skipped": True,
+                                     "reason": "form_disqualified",
+                                     "contact_id": contact_id})
 
             # Stamp state before async send — race-condition safe
             state["entry_path"]         = state.get("entry_path") or "chat_widget"
@@ -8837,7 +9614,14 @@ async def inbound_webhook(request: Request):
                     address=address,
                     lead_source=lead_source,
                     tags=tags,
+                    state=_fb_state,          # [FORM-AWARE] skip known answers
                 )
+                if not _fb_outreach:
+                    ev("FIRST_OUTREACH_SUPPRESSED", contact_id,
+                       reason="form_disqualified", path="fallback")
+                    return JSONResponse({"status": "success", "skipped": True,
+                                         "reason": "form_disqualified",
+                                         "contact_id": contact_id})
                 _fb_state["stage"]              = Stage.ASK_OWNERSHIP
                 _fb_state["location_confirmed"] = True
                 _fb_state["entry_path"]         = _fb_state.get("entry_path") or "chat_widget"
@@ -9793,6 +10577,21 @@ async def after_hours_resume(request: Request):
 
     _ghl_tags = list(compliance.get("tags") or [])
 
+    # ── [FORM-AWARE] Rebuild the Meta form facts before generating ────
+    # An overnight lead's answers live in GHL, not in _state_store, which may
+    # have been wiped between the hold and this resume. The `compliance`
+    # response above already carries the custom fields, so this reuses it and
+    # costs no extra call. Without it a 2 AM qualified lead would get the
+    # generic opener at 9 AM - the exact regression this guards.
+    if FORM_AWARE_ENABLED:
+        _qh_report = await hydrate_form_facts(contact_id, state,
+                                              compliance=compliance)
+        if _qh_report.get("ran"):
+            save_state(contact_id, state)
+            ev("QH_RESUME_FORM_FACTS", contact_id,
+               verdict=_qh_report.get("verdict", ""),
+               missing=",".join(_qh_report.get("missing") or []) or "(none)")
+
     if not convo["latest_inbound"]:
         if convo["last_direction"] == "":
             # No conversation at all -> a FIRST OUTREACH deferred overnight
@@ -9802,10 +10601,16 @@ async def after_hours_resume(request: Request):
             reply = build_new_contact_outreach(
                 first_name  = compliance.get("first_name", ""),
                 full_name   = compliance.get("full_name", ""),
-                address     = "",
+                address     = state.get("address", "") or compliance.get("address", ""),
                 lead_source = state.get("lead_source", ""),
                 tags        = _ghl_tags,
+                state       = state,          # [FORM-AWARE] overnight facts survive
             )
+            if not reply:
+                # [FORM-AWARE] Disqualified by the form overnight. Clear the
+                # hold and send nothing.
+                await clear_after_hours_hold(contact_id)
+                return _skip("form_disqualified", hold_cleared=True)
             _kind = SendKind.OUTREACH
             if state.get("stage") == Stage.INITIAL:
                 state["stage"] = Stage.ASK_OWNERSHIP
