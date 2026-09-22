@@ -928,6 +928,96 @@ class Test21_FieldResolution(FormAwareTestCase):
         self.assertEqual(vals["f2"], ma.Q_UTILITY)
 
 
+class Test23_FieldKeyAliases(FormAwareTestCase):
+    """
+    GHL freezes a custom field's internal key at creation. Renaming the field
+    does not rewrite the key, so contact.qualification_ststus is permanent.
+    Both spellings must resolve to the same field.
+    """
+
+    def test_the_typo_key_maps_to_the_canonical_name(self):
+        self.assertEqual(ma.canonical_field_key("qualification_ststus"),
+                         "qualification_status")
+
+    def test_the_correct_key_still_maps_to_itself(self):
+        self.assertEqual(ma.canonical_field_key("qualification_status"),
+                         "qualification_status")
+
+    def test_the_contact_prefix_is_stripped_before_aliasing(self):
+        self.assertEqual(ma.canonical_field_key("contact.qualification_ststus"),
+                         "qualification_status")
+
+    def test_an_unaliased_key_passes_through_untouched(self):
+        for k in ("homeowner_status", "utility_provider", "avg_monthly_bill"):
+            with self.subTest(k=k):
+                self.assertEqual(ma.canonical_field_key(k), k)
+
+    def test_match_form_field_accepts_the_typo_spelling(self):
+        self.assertEqual(
+            ma._match_form_field({"contact.qualification_ststus": "QUALIFIED"},
+                                 ma.FORM_FIELD_QUAL_STATUS),
+            "QUALIFIED")
+
+    def test_match_form_field_still_accepts_the_correct_spelling(self):
+        self.assertEqual(
+            ma._match_form_field({"contact.qualification_status": "PARTIAL"},
+                                 ma.FORM_FIELD_QUAL_STATUS),
+            "PARTIAL")
+
+    def test_the_write_back_targets_the_typo_key_id(self):
+        captured = {}
+
+        class _Resp:
+            is_success = True
+            status_code = 200
+
+        class _Client:
+            def __init__(self, *a, **k): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+            async def put(self, url, json=None, headers=None):
+                captured["payload"] = json
+                return _Resp()
+
+        async def _schema(force=False):
+            # The REAL production schema: typo key, correct display name.
+            return {"35D91OE7vxt3QgkxTTJa": "qualification_ststus",
+                    "44jgbqQ6ISkdMB8Eay0K": "qualification_missing",
+                    "iMA95PN86XSwL4picIRQ": "form_answers_seen_at"}
+
+        ma.fetch_ghl_custom_field_schema = _schema
+        real_client, real_key = ma.httpx.AsyncClient, ma.GHL_API_KEY
+        ma.httpx.AsyncClient = _Client
+        ma.GHL_API_KEY = "test-key"
+        try:
+            state, _ = self.hydrate(custom_fields=QUALIFIED_FORM)
+            ok = run(ma.sync_qualification_to_ghl("c1", state))
+        finally:
+            ma.httpx.AsyncClient, ma.GHL_API_KEY = real_client, real_key
+
+        self.assertTrue(ok)
+        vals = {e["id"]: e["value"] for e in captured["payload"]["customFields"]}
+        # All THREE managed fields written - not 2 of 3 as before the alias.
+        self.assertEqual(len(vals), 3)
+        self.assertEqual(vals["35D91OE7vxt3QgkxTTJa"], "QUALIFIED")
+
+    def test_the_probe_reports_the_typo_key_as_present(self):
+        async def _s(force=False):
+            return {"a": "homeowner_status", "b": "utility_provider",
+                    "c": "avg_monthly_bill", "d": "qualification_ststus"}
+        ma.fetch_ghl_custom_field_schema = _s
+        real = ma.DEBUG_RESET_SECRET
+        ma.DEBUG_RESET_SECRET = "s3cret"
+        try:
+            class _Req:
+                headers = {"X-Debug-Secret": "s3cret"}
+            r = run(ma.debug_form_schema(_Req()))
+        finally:
+            ma.DEBUG_RESET_SECRET = real
+        self.assertTrue(r["ok"])
+        self.assertTrue(r["managed_fields"]["qualification_status"])
+
+
 class Test22_SchemaProbeEndpoint(FormAwareTestCase):
     """The read-only pre-flight diagnostic. Must leak nothing and mutate nothing."""
 

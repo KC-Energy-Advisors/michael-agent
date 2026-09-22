@@ -2639,6 +2639,45 @@ def utility_state_for_name(name: str) -> Optional[str]:
     return UTIL_PENDING
 
 
+# ── [FORM-AWARE] Field-key aliases ───────────────────────────────────────
+# GHL derives a custom field's internal key from its name AT CREATION and
+# keeps that key forever. Renaming the field in the UI does NOT rewrite the
+# key, so a typo made once is permanent.
+#
+# contact.qualification_ststus was created misspelled. The display name has
+# since been corrected to qualification_status, but the key did not follow -
+# confirmed against the live location schema. Rather than hard-code the typo
+# as the canonical name, the canonical name keeps an alias list and both
+# spellings resolve to the same field.
+#
+# Add to the tuple, never rename the canonical key: existing deployments and
+# the tests both read the canonical name.
+FORM_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    FORM_FIELD_QUAL_STATUS: ("qualification_status", "qualification_ststus"),
+}
+
+
+def _field_key_variants(wanted_key: str) -> tuple[str, ...]:
+    """Every key spelling that means `wanted_key`, canonical name first."""
+    want = str(wanted_key or "").strip().lower()
+    variants = FORM_FIELD_ALIASES.get(want)
+    return variants if variants else (want,)
+
+
+def canonical_field_key(tail: str) -> str:
+    """
+    A schema key tail mapped back to its canonical name.
+
+    contact.qualification_ststus -> qualification_status. Anything with no
+    alias is returned unchanged.
+    """
+    t = str(tail or "").strip().lower().rsplit(".", 1)[-1]
+    for canonical, variants in FORM_FIELD_ALIASES.items():
+        if t in variants:
+            return canonical
+    return t
+
+
 def _match_form_field(custom_fields: dict, wanted_key: str) -> str:
     """
     Value for a GHL custom field, matched on the trailing key segment.
@@ -2646,12 +2685,15 @@ def _match_form_field(custom_fields: dict, wanted_key: str) -> str:
     Tolerates "contact.homeowner_status", "homeowner_status" and
     "Homeowner Status" because GHL surfaces the key differently depending on
     whether the data came from a webhook payload or the contact record.
+
+    [FORM-AWARE] Also accepts any alias in FORM_FIELD_ALIASES, so a field
+    whose internal key was frozen with a typo still resolves.
     """
-    want = wanted_key.strip().lower()
+    wants = _field_key_variants(wanted_key)
     for key, value in (custom_fields or {}).items():
         k = str(key).strip().lower()
         tail = k.rsplit(".", 1)[-1]
-        if tail == want or k == want or tail.replace(" ", "_") == want:
+        if tail in wants or k in wants or tail.replace(" ", "_") in wants:
             return str(value or "").strip()
     return ""
 
@@ -4913,8 +4955,11 @@ async def sync_qualification_to_ghl(contact_id: str, state: dict) -> bool:
             FORM_FIELD_SEEN_AT     : datetime.now(tz=CENTRAL_TZ).isoformat(
                                          timespec="seconds"),
         }
-        payload = [{"id": fid, "value": want[tail]}
-                   for fid, tail in schema.items() if tail in want]
+        # [FORM-AWARE] Resolve each schema key through the alias table, so a
+        # field whose internal key is frozen with a typo still gets written.
+        payload = [{"id": fid, "value": want[canonical_field_key(tail)]}
+                   for fid, tail in schema.items()
+                   if canonical_field_key(tail) in want]
         if not payload:
             ev("QUAL_SYNC_SKIPPED", contact_id, reason="fields_not_found_in_schema")
             return False
@@ -10476,8 +10521,10 @@ async def debug_form_schema(request: Request):
     found  = sorted(set(schema.values()))
 
     def _present(key: str) -> bool:
-        want = key.strip().lower()
-        return any(t == want or t.rsplit(".", 1)[-1] == want for t in found)
+        # [FORM-AWARE] Alias-aware: contact.qualification_ststus satisfies
+        # qualification_status, because GHL froze that key at creation.
+        wants = _field_key_variants(key)
+        return any(t in wants or t.rsplit(".", 1)[-1] in wants for t in found)
 
     required = {k: _present(k) for k in
                 (FORM_FIELD_HOMEOWNER, FORM_FIELD_UTILITY, FORM_FIELD_BILL)}
