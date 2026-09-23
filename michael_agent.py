@@ -3484,6 +3484,62 @@ def is_explicit_scheduling_request(text: str) -> bool:
     return bool(_SCHEDULING_REQUEST_RE.search(t))
 
 
+# ── [GAP-2] Explicit request for the booking LINK ────────────────────────
+# _SCHEDULING_REQUEST_RE already matches "send me your calendar" and
+# "calendar link", but not a bare "link" — so "send me the link" fell through
+# to the normal flow and the link depended on Claude choosing to emit
+# [SEND_BOOKING]. It usually did; it was not guaranteed.
+#
+# Kept as its OWN detector rather than folded into the pattern above, because
+# a link request is gated on at least one confirmed criterion while the
+# call/schedule phrasings are not. Existing behaviour is therefore untouched.
+_BOOKING_LINK_REQUEST_RE = re.compile(
+    r"(?:send|text|shoot|share|resend|re-send|pass)\s+"
+    r"(?:me\s+|over\s+|us\s+)?(?:the\s+|that\s+|a\s+|your\s+|it\s+)?"
+    r"(?:link|booking\s+link|scheduling\s+link|sign[- ]?up\s+link)"
+    r"|(?:where|what)'?s?\s+(?:is\s+)?(?:the|that|your)\s+link"
+    r"|(?:can|could|would|will)\s+(?:you|u)\s+send\s+(?:me\s+)?(?:the\s+|that\s+)?link"
+    r"|send\s+(?:it|that)\s+(?:over|again)"
+    r"|link\s+again"
+    r"|(?:the\s+)?link\s+(?:didn'?t|did\s+not|doesn'?t|does\s+not|won'?t)\s+work",
+    re.IGNORECASE,
+)
+
+# A link named inside a refusal is not a request for one. "Don't send me the
+# link" and "stop sending links" must never be read as high intent.
+_BOOKING_LINK_NEGATION_RE = re.compile(
+    r"\b(?:don'?t|do\s+not|stop|no\s+more|quit|already\s+(?:have|got)"
+    r"|not\s+interested|unsubscribe)\b",
+    re.IGNORECASE,
+)
+
+
+def is_booking_link_request(text: str) -> bool:
+    """True when the lead has unambiguously asked us to send the link."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if _BOOKING_LINK_NEGATION_RE.search(t):
+        return False
+    return bool(_BOOKING_LINK_REQUEST_RE.search(t))
+
+
+def confirmed_criteria_count(state: dict) -> int:
+    """
+    [GAP-2] How many of the three criteria are POSITIVELY confirmed.
+
+    A gate, not a verdict. UNKNOWN does not count, and neither does
+    UTIL_PENDING — "not Ameren, provider unnamed" is an open question, not a
+    confirmation. Asking for the link is strong intent, but on its own it is
+    not evidence that this is a homeowner we can serve.
+    """
+    return sum((
+        (state.get("q_homeowner")     or QUAL_UNKNOWN) == QUAL_YES,
+        (state.get("q_utility")       or QUAL_UNKNOWN) == UTIL_AMEREN,
+        (state.get("q_bill_100_plus") or QUAL_UNKNOWN) == QUAL_YES,
+    ))
+
+
 class ConversionDecision(NamedTuple):
     """
     One routing verdict, described fully enough that its log line explains
@@ -3555,6 +3611,24 @@ def decide_conversion_action(state: dict,
             "lead explicitly asked to talk or schedule",
         )
 
+    # ── D2 [GAP-2]: explicit request for the booking link ────────
+    # Gated, unlike branch D above: asking for the link is strong intent but
+    # no evidence of fitness, so a lead we know NOTHING about cannot pull the
+    # link simply by asking. One confirmed criterion is enough — the rest
+    # travel with the link as conditions via criteria_clause().
+    #
+    # On a failed gate this deliberately FALLS THROUGH rather than returning,
+    # so "yes send me the link" after a conversion invitation is still caught
+    # by branch E exactly as it is today.
+    _link_request = is_booking_link_request(inbound_text)
+    if _link_request:
+        _confirmed = confirmed_criteria_count(state)
+        if _confirmed >= 1:
+            return ConversionDecision(
+                IN_SCHEDULING, prev_type, ACT_SEND_BOOKING,
+                f"lead asked for the booking link — {_confirmed}/3 criteria confirmed",
+            )
+
     _facts       = extract_qualification_facts(inbound_text, prev_type)
     _told_us     = bool({Q_HOMEOWNER, Q_UTILITY, Q_BILL} & set(_facts))
     _affirmative = is_affirmative_reply(inbound_text) or is_blanket_confirmation(inbound_text)
@@ -3579,7 +3653,10 @@ def decide_conversion_action(state: dict,
     if not _affirmative:
         return ConversionDecision(
             IN_NONE, prev_type, ACT_NO_OVERRIDE,
-            "inbound is not a bare affirmative",
+            # [GAP-2] Name the gate when it is what held the link back, so the
+            # log says "qualify first" rather than the generic fall-through.
+            ("link requested but no criterion confirmed yet — qualify first"
+             if _link_request else "inbound is not a bare affirmative"),
         )
 
     # ── E: affirmative — its meaning is whatever we asked last ───

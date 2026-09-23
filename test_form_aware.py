@@ -1199,5 +1199,188 @@ class Test24_BareNumberBillReplies(FormAwareTestCase):
         self.assertEqual(ma.qualification_verdict(state)[0], ma.VERDICT_DISQUALIFIED)
 
 
+class Test25_BookingLinkRequests(FormAwareTestCase):
+    """
+    [GAP-2] "send me the link" is about as unambiguous as booking intent
+    gets, yet it fell through to the normal flow and the link depended on
+    Claude emitting [SEND_BOOKING]. It usually did; it was not guaranteed.
+
+    Now deterministic - but GATED. Asking for the link is strong intent and
+    no evidence of fitness, so a lead we know nothing about cannot pull the
+    link simply by asking.
+    """
+
+    POSITIVE = [
+        "send me the link", "can you send the link", "send that link",
+        "where's the link", "wheres the link", "send the link",
+        "send me that link", "send me a link", "text me the link",
+        "shoot me the link", "send it over", "send that over",
+        "can u send me the link", "could you send me the link",
+        "what's the link", "send me the booking link", "share the link",
+        "send me the scheduling link", "resend the link",
+        "send the link again", "the link didn't work",
+        "send me the sign up link",
+    ]
+    NEGATIVE = [
+        "don't send me the link", "stop sending links",
+        "I already have the link", "no more links", "is this link safe",
+        "I clicked the link and nothing happened", "not interested",
+        "unsubscribe", "link", "the link", "yeah", "yes", "stop", "STOP",
+        "is this solar", "around 180", "I have Ameren", "my bill is 200",
+        "who is this", "why are you texting me", "I'm the homeowner",
+        "what is this about", "already booked", "how much does it cost",
+    ]
+
+    def _state(self, **fields):
+        ma._state_store.clear()
+        s = ma.get_state("link")
+        s.update(fields)
+        return s
+
+    # -- detector -------------------------------------------------
+    def test_every_positive_phrasing_is_a_link_request(self):
+        for t in self.POSITIVE:
+            with self.subTest(text=t):
+                self.assertTrue(ma.is_booking_link_request(t), t)
+
+    def test_no_negative_phrasing_is_a_link_request(self):
+        for t in self.NEGATIVE:
+            with self.subTest(text=t):
+                self.assertFalse(ma.is_booking_link_request(t), t)
+
+    def test_a_refusal_naming_the_link_is_not_a_request(self):
+        for t in ("don't send me the link", "stop sending links",
+                  "no more links", "I already have the link"):
+            with self.subTest(text=t):
+                self.assertFalse(ma.is_booking_link_request(t), t)
+
+    def test_empty_input_is_safe(self):
+        for t in ("", "   ", None):
+            self.assertFalse(ma.is_booking_link_request(t))
+
+    # -- the qualification gate -----------------------------------
+    def test_confirmed_criteria_count(self):
+        for fields, want in (
+            ({}, 0),
+            ({"q_homeowner": ma.QUAL_YES}, 1),
+            ({"q_utility": ma.UTIL_AMEREN}, 1),
+            ({"q_bill_100_plus": ma.QUAL_YES}, 1),
+            ({"q_homeowner": ma.QUAL_YES, "q_utility": ma.UTIL_AMEREN}, 2),
+            ({"q_homeowner": ma.QUAL_YES, "q_utility": ma.UTIL_AMEREN,
+              "q_bill_100_plus": ma.QUAL_YES}, 3),
+        ):
+            with self.subTest(fields=fields):
+                self.assertEqual(ma.confirmed_criteria_count(self._state(**fields)), want)
+
+    def test_pending_utility_does_NOT_count_as_confirmed(self):
+        self.assertEqual(
+            ma.confirmed_criteria_count(self._state(q_utility=ma.UTIL_PENDING)), 0)
+
+    def test_a_disqualifying_answer_does_NOT_count_as_confirmed(self):
+        self.assertEqual(
+            ma.confirmed_criteria_count(
+                self._state(q_homeowner=ma.QUAL_NO, q_bill_100_plus=ma.QUAL_NO)), 0)
+
+    def test_zero_confirmed_criteria_does_NOT_get_the_link(self):
+        d = ma.decide_conversion_action(self._state(), "send me the link")
+        self.assertEqual(d.action, ma.ACT_NO_OVERRIDE)
+        self.assertIn("qualify first", d.reason)
+
+    def test_pending_utility_alone_does_NOT_get_the_link(self):
+        d = ma.decide_conversion_action(
+            self._state(q_utility=ma.UTIL_PENDING), "send me the link")
+        self.assertEqual(d.action, ma.ACT_NO_OVERRIDE)
+
+    def test_one_confirmed_criterion_IS_enough(self):
+        for fields in ({"q_homeowner": ma.QUAL_YES},
+                       {"q_utility": ma.UTIL_AMEREN},
+                       {"q_bill_100_plus": ma.QUAL_YES}):
+            with self.subTest(fields=fields):
+                d = ma.decide_conversion_action(self._state(**fields), "send me the link")
+                self.assertEqual(d.action, ma.ACT_SEND_BOOKING)
+
+    def test_a_fully_qualified_lead_gets_the_link(self):
+        d = ma.decide_conversion_action(
+            self._state(q_homeowner=ma.QUAL_YES, q_utility=ma.UTIL_AMEREN,
+                        q_bill_100_plus=ma.QUAL_YES), "send me the link")
+        self.assertEqual(d.action, ma.ACT_SEND_BOOKING)
+        self.assertIn("3/3", d.reason)
+
+    def test_a_disqualified_lead_NEVER_gets_the_link(self):
+        for fields in ({"q_homeowner": ma.QUAL_NO},
+                       {"q_utility": ma.UTIL_OTHER},
+                       {"q_bill_100_plus": ma.QUAL_NO}):
+            with self.subTest(fields=fields):
+                base = {"q_homeowner": ma.QUAL_YES, "q_utility": ma.UTIL_AMEREN,
+                        "q_bill_100_plus": ma.QUAL_YES}
+                base.update(fields)
+                d = ma.decide_conversion_action(self._state(**base), "send me the link")
+                self.assertEqual(d.action, ma.ACT_NO_OVERRIDE)
+                self.assertIn("criterion failed", d.reason)
+
+    def test_the_gate_applies_to_every_positive_phrasing(self):
+        for t in self.POSITIVE:
+            with self.subTest(text=t):
+                self.assertEqual(
+                    ma.decide_conversion_action(self._state(), t).action,
+                    ma.ACT_NO_OVERRIDE, t)
+                self.assertEqual(
+                    ma.decide_conversion_action(
+                        self._state(q_homeowner=ma.QUAL_YES), t).action,
+                    ma.ACT_SEND_BOOKING, t)
+
+    # -- existing behaviour must not move -------------------------
+    def test_call_and_schedule_phrasings_stay_UNGATED(self):
+        for t in ("call me", "what times do you have", "let's talk",
+                  "send me your calendar", "calendar link", "pick a time"):
+            with self.subTest(text=t):
+                self.assertEqual(
+                    ma.decide_conversion_action(self._state(), t).action,
+                    ma.ACT_SEND_BOOKING, t)
+
+    def test_existing_scheduling_detector_is_unchanged(self):
+        for t in ("call me", "what times do you have", "let's talk",
+                  "send me your calendar", "calendar link",
+                  "when are you available", "book me a time", "come by",
+                  "how do I schedule", "pick a time", "give me a call"):
+            with self.subTest(text=t):
+                self.assertTrue(ma.is_explicit_scheduling_request(t), t)
+
+    def test_a_negated_link_request_falls_through_untouched(self):
+        d = ma.decide_conversion_action(
+            self._state(q_homeowner=ma.QUAL_YES), "don't send me the link")
+        self.assertEqual(d.action, ma.ACT_NO_OVERRIDE)
+        self.assertNotIn("qualify first", d.reason)
+
+    # -- end to end -----------------------------------------------
+    def test_link_is_sent_even_when_claude_emits_no_tag(self):
+        self.claude.reply_text = "Absolutely."
+        s = self._state(q_homeowner=ma.QUAL_YES, q_utility=ma.UTIL_AMEREN,
+                        q_bill_100_plus=ma.QUAL_YES, stage=ma.Stage.ASK_BILL)
+        ma.save_state("link", s)
+        out = ma.michael_agent("link", "send me the link")
+        self.assertIn(ma.BOOKING_LINK, out or "")
+
+    def test_no_link_for_an_unknown_lead_even_when_asked(self):
+        self.claude.reply_text = "Happy to help."
+        s = self._state(stage=ma.Stage.ASK_OWNERSHIP)
+        ma.save_state("link", s)
+        out = ma.michael_agent("link", "send me the link")
+        self.assertNotIn(ma.BOOKING_LINK, out or "")
+
+    def test_booked_contact_asking_for_the_link_is_still_locked_out(self):
+        self.claude.reply_text = "Sure. [SEND_BOOKING]"
+        s = self._state(stage=ma.Stage.BOOKED, appointment_booked=True,
+                        q_homeowner=ma.QUAL_YES)
+        ma.save_state("link", s)
+        out = ma.michael_agent("link", "send me the link")
+        self.assertNotIn(ma.BOOKING_LINK, out or "")
+
+    def test_dnc_contact_asking_for_the_link_gets_nothing(self):
+        s = self._state(stage=ma.Stage.DNC, q_homeowner=ma.QUAL_YES)
+        ma.save_state("link", s)
+        self.assertIsNone(ma.michael_agent("link", "send me the link"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
