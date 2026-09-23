@@ -1090,5 +1090,114 @@ class Test22_SchemaProbeEndpoint(FormAwareTestCase):
         self.assertEqual(ma._state_store, before)
 
 
+class Test24_BareNumberBillReplies(FormAwareTestCase):
+    """
+    [GAP-1] Michael asks "what's your electric bill running most months?" and
+    the homeowner answers "around 180". Before this fix that answer was
+    dropped: a bare number needed a bill word nearby, and neither the
+    previous-outbound type nor pending_question rescued it, so the lead
+    could never reach QUALIFIED.
+
+    A bare number counts as a bill figure ONLY when the conversation put the
+    bill question on the table. Outside that context nothing changes.
+    """
+
+    MUST_PARSE = ["180", "around 180", "180/month", "$180", "probably 180",
+                  "probably like 150-200", "150-200", "about 200",
+                  "200 bucks", "like 180"]
+
+    def test_every_required_phrasing_parses_in_bill_context(self):
+        for t in self.MUST_PARSE:
+            with self.subTest(text=t):
+                f = ma.extract_qualification_facts(
+                    t, previous_outbound_type=ma.OUT_BILL_Q)
+                self.assertEqual(f.get(ma.Q_BILL), ma.QUAL_YES, t)
+
+    def test_every_required_phrasing_yields_an_amount(self):
+        for t in self.MUST_PARSE:
+            with self.subTest(text=t):
+                f = ma.extract_qualification_facts(
+                    t, previous_outbound_type=ma.OUT_BILL_Q)
+                self.assertTrue(str(f.get("bill_amount", "")).startswith("$"), t)
+
+    def test_bare_numbers_are_NOT_bills_outside_bill_context(self):
+        # The whole point: no global "any number is a bill" behaviour.
+        for t in [x for x in self.MUST_PARSE if "$" not in x]:
+            with self.subTest(text=t):
+                f = ma.extract_qualification_facts(t)
+                self.assertIsNone(f.get(ma.Q_BILL), t)
+
+    def test_explicit_currency_still_parses_without_context(self):
+        f = ma.extract_qualification_facts("$180")
+        self.assertEqual(f.get(ma.Q_BILL), ma.QUAL_YES)
+
+    def test_pending_question_bill_is_an_independent_context_signal(self):
+        f = ma.extract_qualification_facts("around 180", bill_context=True)
+        self.assertEqual(f.get(ma.Q_BILL), ma.QUAL_YES)
+
+    def test_non_numeric_replies_in_bill_context_settle_nothing(self):
+        for t in ("no", "not sure", "yes", "idk", "why do you ask"):
+            with self.subTest(text=t):
+                f = ma.extract_qualification_facts(
+                    t, previous_outbound_type=ma.OUT_BILL_Q)
+                self.assertIsNone(f.get(ma.Q_BILL), t)
+
+    def test_out_of_band_numbers_are_ignored_even_in_bill_context(self):
+        # Too small to be a bill, and a phone number must never parse.
+        for t in ("I have 3 kids", "call me at 5", "3145550123"):
+            with self.subTest(text=t):
+                f = ma.extract_qualification_facts(
+                    t, previous_outbound_type=ma.OUT_BILL_Q)
+                self.assertIsNone(f.get(ma.Q_BILL), t)
+
+    def test_a_low_range_disqualifies(self):
+        f = ma.extract_qualification_facts("50-80", previous_outbound_type=ma.OUT_BILL_Q)
+        self.assertEqual(f.get(ma.Q_BILL), ma.QUAL_NO)
+
+    def test_a_range_straddling_the_threshold_is_left_unresolved(self):
+        # 75-125 could be either side. Guessing here would be worse than asking.
+        f = ma.extract_qualification_facts("75-125", previous_outbound_type=ma.OUT_BILL_Q)
+        self.assertIsNone(f.get(ma.Q_BILL))
+
+    def test_a_high_range_takes_the_conservative_low_end(self):
+        f = ma.extract_qualification_facts("150-200", previous_outbound_type=ma.OUT_BILL_Q)
+        self.assertEqual(f.get("bill_amount"), "$150/month")
+
+    def test_explicit_bill_language_is_unchanged(self):
+        # Pre-existing behaviour must be byte-identical.
+        for t, want in (("my bill is around 180", ma.QUAL_YES),
+                        ("about 180 a month", ma.QUAL_YES),
+                        ("we pay about 250", ma.QUAL_YES),
+                        ("electric runs 300", ma.QUAL_YES),
+                        ("it's like $70 a month", ma.QUAL_NO)):
+            with self.subTest(text=t):
+                self.assertEqual(
+                    ma.extract_qualification_facts(t).get(ma.Q_BILL), want, t)
+
+    def test_the_answer_completes_qualification_end_to_end(self):
+        # CASE 7 from certification: form gave homeowner+utility, bill missing.
+        state, _ = self.hydrate(
+            custom_fields=form_fields(homeowner="Yes", utility="Ameren Missouri"))
+        self.assertEqual(ma.qualification_verdict(state)[1], [ma.Q_BILL])
+        ma.apply_qualification_facts(
+            state,
+            ma.extract_qualification_facts("around 180",
+                                           previous_outbound_type=ma.OUT_BILL_Q),
+            "c1")
+        verdict, missing = ma.qualification_verdict(state)
+        self.assertEqual(verdict, ma.VERDICT_QUALIFIED)
+        self.assertEqual(missing, [])
+
+    def test_a_low_bare_number_answer_disqualifies_end_to_end(self):
+        state, _ = self.hydrate(
+            custom_fields=form_fields(homeowner="Yes", utility="Ameren Missouri"))
+        ma.apply_qualification_facts(
+            state,
+            ma.extract_qualification_facts("about 70",
+                                           previous_outbound_type=ma.OUT_BILL_Q),
+            "c1")
+        self.assertEqual(ma.qualification_verdict(state)[0], ma.VERDICT_DISQUALIFIED)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

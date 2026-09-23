@@ -2809,6 +2809,14 @@ _UTIL_NOT_AMEREN_GENERIC_RE = re.compile(
 _BILL_CONTEXT_RE = re.compile(r"\b(bill|electric|power|ameren|pay|spend)\b", re.IGNORECASE)
 _BILL_BARE_NUM_RE = re.compile(r"\b(\d{2,4})\b")
 
+# [GAP-1] A stated range: "150-200", "150 to 200", "probably like 150-200".
+# Only consulted when the message is about the bill - either because it says
+# so, or because the previous outbound ASKED for the bill. A range that
+# straddles the threshold is deliberately left unresolved rather than guessed.
+_BILL_RANGE_RE = re.compile(
+    r"\b(\d{2,4})\s*(?:-|–|—|to)\s*\$?\s*(\d{2,4})\b"
+)
+
 _BILL_OVER_RE = re.compile(
     r"\b(over|above|more\s+than|north\s+of|at\s+least|upwards\s+of|higher\s+than)\b"
     r"[^\d]{0,12}\$?\s*(\d{2,4})",
@@ -2866,12 +2874,23 @@ def _detect_utility(text: str) -> Optional[str]:
     return None
 
 
-def _detect_bill_threshold(text: str) -> tuple[Optional[str], str]:
+def _detect_bill_threshold(text: str,
+                           bill_context: bool = False) -> tuple[Optional[str], str]:
     """
     (verdict, amount_string) where verdict is QUAL_YES / QUAL_NO / None and
     amount_string is "$NNN/month" when a concrete figure was given, else "".
+
+    [GAP-1] `bill_context` means the conversation has established that this
+    message is the ANSWER to the bill question - the previous outbound was a
+    bill question, or pending_question is "bill". Only then is a bare number
+    like "180" or "150-200" read as a dollar figure.
+
+    Without that context the behaviour is byte-for-byte what it always was:
+    a bare number needs a bill word (bill/electric/power/ameren/pay/spend)
+    nearby, so "I have 3 kids" or a house number is never a bill.
     """
     t = text or ""
+    _ctx = bool(bill_context) or bool(_BILL_CONTEXT_RE.search(t))
 
     m = _BILL_OVER_RE.search(t)
     if m:
@@ -2889,8 +2908,24 @@ def _detect_bill_threshold(text: str) -> tuple[Optional[str], str]:
         except ValueError:
             pass
 
+    # [GAP-1] A stated range, before the single-figure parse: "150-200" has
+    # no "$" so _detect_bill_amount() cannot see it. Decide only when the
+    # WHOLE range sits on one side of the threshold.
+    m = _BILL_RANGE_RE.search(t)
+    if m and _ctx:
+        try:
+            lo, hi = int(m.group(1)), int(m.group(2))
+            if 10 <= lo <= 2000 and 10 <= hi <= 2000 and lo <= hi:
+                if lo >= BILL_THRESHOLD:
+                    return QUAL_YES, f"${lo}/month"   # conservative: low end
+                if hi < BILL_THRESHOLD:
+                    return QUAL_NO, f"${hi}/month"
+                return None, ""      # straddles the threshold - do not guess
+        except ValueError:
+            pass
+
     amount = _detect_bill_amount(t)
-    if not amount and _BILL_CONTEXT_RE.search(t):
+    if not amount and _ctx:
         for raw in _BILL_BARE_NUM_RE.findall(t):
             try:
                 val = int(raw)
@@ -2907,7 +2942,7 @@ def _detect_bill_threshold(text: str) -> tuple[Optional[str], str]:
         except ValueError:
             return None, ""
 
-    if _BILL_VAGUE_HIGH_RE.search(t) and _BILL_CONTEXT_RE.search(t):
+    if _BILL_VAGUE_HIGH_RE.search(t) and _ctx:
         return QUAL_YES, ""
 
     return None, ""
@@ -2980,7 +3015,8 @@ def is_blanket_confirmation(text: str) -> bool:
 
 def extract_qualification_facts(text: str,
                                 previous_outbound_type: str = "unknown",
-                                utility_pending: bool = False) -> dict:
+                                utility_pending: bool = False,
+                                bill_context: bool = False) -> dict:
     """
     Facts this inbound message establishes, as {field: value}. Only fields the
     message genuinely settles appear; everything else is simply absent.
@@ -3030,7 +3066,11 @@ def extract_qualification_facts(text: str,
         facts[Q_UTILITY]   = util
         facts["_source"]   = "explicit"
 
-    bill_verdict, bill_amount = _detect_bill_threshold(t)
+    # [GAP-1] A bare number is a bill figure only when the conversation put
+    # the bill question on the table. Derived here so every existing caller
+    # that already passes previous_outbound_type gets the fix for free.
+    _bill_ctx = bool(bill_context) or previous_outbound_type == OUT_BILL_Q
+    bill_verdict, bill_amount = _detect_bill_threshold(t, bill_context=_bill_ctx)
     if bill_verdict:
         facts[Q_BILL]      = bill_verdict
         facts["_source"]   = "explicit"
@@ -6244,6 +6284,9 @@ def michael_agent(contact_id: str, inbound_text: str, ghl_pipeline_stage: str = 
             inbound_text,
             previous_outbound_type=_prev_type,
             utility_pending=(state.get("q_utility") == UTIL_PENDING),
+            # [GAP-1] pending_question is a second, independent signal that we
+            # are waiting on the bill. Belt and braces with _prev_type.
+            bill_context=(state.get("pending_question") == "bill"),
         )
         apply_qualification_facts(state, _facts, contact_id)
         sync_qualification_fields(state)
