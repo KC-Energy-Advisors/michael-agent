@@ -1382,5 +1382,211 @@ class Test25_BookingLinkRequests(FormAwareTestCase):
         self.assertIsNone(ma.michael_agent("link", "send me the link"))
 
 
+class Test26_NoFormFieldsNegativeCache(FormAwareTestCase):
+    """
+    A contact with no form answers never sets form_facts_loaded, so its three
+    criteria stayed UNKNOWN and every later inbound re-fetched the same empty
+    contact record - one GHL GET per message, forever. Every legacy V1 lead is
+    in that state.
+
+    A CONFIRMED absence is now remembered for the process lifetime. A failed
+    or indeterminate lookup is NOT a confirmed absence and is never cached.
+    """
+
+    def setUp(self):
+        super().setUp()
+        ma._no_form_fields.clear()
+        self.addCleanup(ma._no_form_fields.clear)
+
+    def _counting_stub(self, cf, ok=True):
+        """Returns the call log; the stub records every GHL fetch."""
+        calls = []
+        async def _f(contact_id):
+            calls.append(contact_id)
+            return {"ok": ok, "first_name": "S", "full_name": "S",
+                    "phone": "+13145550123", "email": "", "dnd": False,
+                    "dnd_sms": {}, "tags": [], "date_added": "",
+                    "http": 200 if ok else 500,
+                    "custom_fields": dict(cf or {}), "address": ""}
+        ma.fetch_ghl_contact_compliance = _f
+        return calls
+
+    def _raising_stub(self):
+        calls = []
+        async def _f(contact_id):
+            calls.append(contact_id)
+            raise TimeoutError("ghl timeout")
+        ma.fetch_ghl_contact_compliance = _f
+        return calls
+
+    # -- successful negative caching -------------------------------
+    def test_a_confirmed_absence_is_fetched_once_then_cached(self):
+        calls = self._counting_stub({})
+        st = ma.get_state("neg")
+        for _ in range(5):
+            run(ma.hydrate_form_facts("neg", st))
+        self.assertEqual(len(calls), 1, "should fetch once, then use the cache")
+
+    def test_the_cached_reason_is_reported(self):
+        self._counting_stub({})
+        st = ma.get_state("neg")
+        run(ma.hydrate_form_facts("neg", st))
+        second = run(ma.hydrate_form_facts("neg", st))
+        self.assertEqual(second["reason"], "no_form_fields_cached")
+        self.assertFalse(second["ran"])
+
+    def test_the_contact_is_recorded_in_the_cache(self):
+        self._counting_stub({})
+        run(ma.hydrate_form_facts("neg", ma.get_state("neg")))
+        self.assertIn("neg", ma._no_form_fields)
+
+    def test_the_cache_is_per_contact(self):
+        calls = self._counting_stub({})
+        run(ma.hydrate_form_facts("a", ma.get_state("a")))
+        run(ma.hydrate_form_facts("b", ma.get_state("b")))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(ma._no_form_fields, {"a", "b"})
+
+    def test_qualification_state_is_untouched_by_the_cache(self):
+        self._counting_stub({})
+        st = ma.get_state("neg")
+        for _ in range(3):
+            run(ma.hydrate_form_facts("neg", st))
+        self.assertEqual(st["q_homeowner"], ma.QUAL_UNKNOWN)
+        self.assertEqual(st["q_utility"], ma.QUAL_UNKNOWN)
+        self.assertEqual(st["q_bill_100_plus"], ma.QUAL_UNKNOWN)
+
+    def test_a_cached_contact_still_gets_the_legacy_opener(self):
+        self._counting_stub({})
+        st = ma.get_state("neg")
+        run(ma.hydrate_form_facts("neg", st))
+        run(ma.hydrate_form_facts("neg", st))
+        msg = ma.build_new_contact_outreach(first_name="Sarah", state=st)
+        self.assertIn("Ameren Missouri", msg)
+
+    # -- failures must NOT be cached -------------------------------
+    def test_an_api_failure_is_NOT_cached_and_retries(self):
+        calls = self._counting_stub({}, ok=False)
+        st = ma.get_state("fail")
+        for _ in range(3):
+            run(ma.hydrate_form_facts("fail", st))
+        self.assertEqual(len(calls), 3, "a failed lookup must retry every time")
+        self.assertNotIn("fail", ma._no_form_fields)
+
+    def test_a_timeout_is_NOT_cached_and_retries(self):
+        calls = self._raising_stub()
+        st = ma.get_state("boom")
+        for _ in range(3):
+            run(ma.hydrate_form_facts("boom", st))
+        self.assertEqual(len(calls), 3)
+        self.assertNotIn("boom", ma._no_form_fields)
+
+    def test_a_failure_then_a_success_still_caches(self):
+        st = ma.get_state("flaky")
+        self._counting_stub({}, ok=False)
+        run(ma.hydrate_form_facts("flaky", st))
+        self.assertNotIn("flaky", ma._no_form_fields)
+        calls = self._counting_stub({})          # GHL recovers
+        run(ma.hydrate_form_facts("flaky", st))
+        self.assertIn("flaky", ma._no_form_fields)
+        run(ma.hydrate_form_facts("flaky", st))
+        self.assertEqual(len(calls), 1)
+
+    def test_a_failure_then_real_data_hydrates_normally(self):
+        st = ma.get_state("recover")
+        self._counting_stub({}, ok=False)
+        run(ma.hydrate_form_facts("recover", st))
+        self._counting_stub(QUALIFIED_FORM)
+        rep = run(ma.hydrate_form_facts("recover", st))
+        self.assertTrue(rep["ran"])
+        self.assertEqual(st["q_homeowner"], ma.QUAL_YES)
+        self.assertNotIn("recover", ma._no_form_fields)
+
+    # -- real form data is unaffected ------------------------------
+    def test_real_form_data_hydrates_and_is_never_cached_negative(self):
+        calls = self._counting_stub(QUALIFIED_FORM)
+        st = ma.get_state("good")
+        rep = run(ma.hydrate_form_facts("good", st))
+        self.assertTrue(rep["ran"])
+        self.assertNotIn("good", ma._no_form_fields)
+        self.assertEqual(len(calls), 1)
+
+    def test_hydrated_contact_short_circuits_on_already_hydrated(self):
+        calls = self._counting_stub(QUALIFIED_FORM)
+        st = ma.get_state("good")
+        for _ in range(4):
+            run(ma.hydrate_form_facts("good", st))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            run(ma.hydrate_form_facts("good", st))["reason"], "already_hydrated")
+
+    def test_partial_form_data_is_not_cached_negative(self):
+        # One field present is not an absence.
+        self._counting_stub(form_fields(homeowner="Yes"))
+        st = ma.get_state("partial")
+        run(ma.hydrate_form_facts("partial", st))
+        self.assertNotIn("partial", ma._no_form_fields)
+        self.assertEqual(st["q_homeowner"], ma.QUAL_YES)
+
+    def test_a_webhook_payload_with_answers_beats_the_cache(self):
+        calls = self._counting_stub({})
+        st = ma.get_state("wh")
+        run(ma.hydrate_form_facts("wh", st))          # caches the absence
+        self.assertIn("wh", ma._no_form_fields)
+        body = {"customData": dict(QUALIFIED_FORM)}   # a later webhook carries them
+        rep = run(ma.hydrate_form_facts("wh", st, body=body))
+        self.assertTrue(rep["ran"])
+        self.assertEqual(st["q_homeowner"], ma.QUAL_YES)
+        self.assertEqual(len(calls), 1, "payload answers need no extra fetch")
+
+    # -- later conversational corrections still work ---------------
+    def test_explicit_correction_works_on_a_cached_contact(self):
+        self._counting_stub({})
+        st = ma.get_state("conv")
+        for _ in range(3):
+            run(ma.hydrate_form_facts("conv", st))
+        ma.apply_qualification_facts(
+            st, ma.extract_qualification_facts("I own it and I'm on Ameren"), "conv")
+        self.assertEqual(st["q_homeowner"], ma.QUAL_YES)
+        self.assertEqual(st["q_utility"], ma.UTIL_AMEREN)
+
+    def test_a_cached_contact_can_still_reach_qualified_by_conversation(self):
+        self._counting_stub({})
+        st = ma.get_state("conv2")
+        run(ma.hydrate_form_facts("conv2", st))
+        for inbound, prev in (("yes I own it", ma.OUT_OWNERSHIP_Q),
+                              ("I have Ameren", ma.OUT_UTILITY_Q),
+                              ("around 180", ma.OUT_BILL_Q)):
+            ma.apply_qualification_facts(
+                st, ma.extract_qualification_facts(inbound, previous_outbound_type=prev),
+                "conv2")
+        self.assertEqual(ma.qualification_verdict(st)[0], ma.VERDICT_QUALIFIED)
+
+    def test_caching_does_not_block_a_later_disqualifying_correction(self):
+        self._counting_stub({})
+        st = ma.get_state("conv3")
+        run(ma.hydrate_form_facts("conv3", st))
+        ma.apply_qualification_facts(
+            st, ma.extract_qualification_facts("I rent"), "conv3")
+        self.assertEqual(ma.qualification_verdict(st)[0], ma.VERDICT_DISQUALIFIED)
+
+    # -- housekeeping ----------------------------------------------
+    def test_the_cache_is_lru_bounded(self):
+        for i in range(ma._MAX_NO_FORM_CACHE + 50):
+            ma._remember_no_form_fields(f"c{i}")
+        self.assertLessEqual(len(ma._no_form_fields), ma._MAX_NO_FORM_CACHE)
+
+    def test_an_empty_contact_id_is_never_cached(self):
+        ma._remember_no_form_fields("")
+        self.assertNotIn("", ma._no_form_fields)
+
+    def test_flag_off_never_touches_the_cache(self):
+        ma.FORM_AWARE_ENABLED = False
+        calls = self._counting_stub({})
+        run(ma.hydrate_form_facts("off", ma.get_state("off")))
+        self.assertEqual(len(calls), 0)
+        self.assertEqual(ma._no_form_fields, set())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
