@@ -4944,6 +4944,40 @@ async def fetch_ghl_contact_compliance(contact_id: str) -> dict:
 #  it sends no SMS. It cannot bypass a gate because it never reaches one.
 # ═══════════════════════════════════════════════════════════════════════
 
+# [FORM-AWARE] Contacts GHL has CONFIRMED carry no form answers.
+#
+# A contact with no form data never sets form_facts_loaded, so its three
+# criteria stay UNKNOWN and every later inbound message re-fetched the same
+# empty contact record - measured at one GHL GET per message, forever. Every
+# legacy V1 lead is in exactly that state.
+#
+# Only a SUCCESSFUL lookup that came back without the three fields lands
+# here. An API error, a timeout, a malformed response or any indeterminate
+# result is NOT a negative result and is never cached, so a transient GHL
+# failure can never permanently blind the agent to a lead's form answers.
+#
+# Process-local and LRU-bounded, exactly like the dedup caches: a restart
+# clears it and the next message re-checks.
+_no_form_fields: set[str] = set()
+_MAX_NO_FORM_CACHE = 4000
+
+
+def _remember_no_form_fields(contact_id: str) -> None:
+    """Record a CONFIRMED absence. Callers must verify the lookup succeeded."""
+    if not contact_id:
+        return
+    if len(_no_form_fields) >= _MAX_NO_FORM_CACHE:
+        for _k in list(_no_form_fields)[: _MAX_NO_FORM_CACHE // 2]:
+            _no_form_fields.discard(_k)
+    _no_form_fields.add(contact_id)
+
+
+def _has_any_form_field(custom_fields: dict) -> bool:
+    """True when at least one of the three form fields is present."""
+    return any(_match_form_field(custom_fields, k) for k in
+               (FORM_FIELD_HOMEOWNER, FORM_FIELD_UTILITY, FORM_FIELD_BILL))
+
+
 async def hydrate_form_facts(contact_id: str,
                              state: dict,
                              body: dict | None = None,
@@ -4953,7 +4987,8 @@ async def hydrate_form_facts(contact_id: str,
     contact. Returns a small report dict for logging; never raises.
 
     Cheap by design: if every criterion is already settled in memory there
-    is nothing to learn, so no API call is made.
+    is nothing to learn, and if GHL has already confirmed this contact has
+    no form answers there is nothing to fetch. Either way, no API call.
     """
     report = {"ran": False, "source": "", "applied": [], "verdict": "",
               "missing": [], "reason": ""}
@@ -4985,13 +5020,19 @@ async def hydrate_form_facts(contact_id: str,
             if cf:
                 report["source"] = "webhook_payload"
 
+        # GHL already told us this contact has none. Checked AFTER the webhook
+        # payload, so a later webhook that does carry the answers still wins.
+        if not _has_any_form_field(cf) and contact_id in _no_form_fields:
+            report["reason"] = "no_form_fields_cached"
+            return report
+
         # 2. Otherwise the contact record - the durable source of truth.
-        if not _match_form_field(cf, FORM_FIELD_HOMEOWNER) and \
-           not _match_form_field(cf, FORM_FIELD_UTILITY) and \
-           not _match_form_field(cf, FORM_FIELD_BILL):
+        _lookup_ok = False
+        if not _has_any_form_field(cf):
             c = compliance if isinstance(compliance, dict) and compliance.get("ok") \
                 else await fetch_ghl_contact_compliance(contact_id)
             if c.get("ok"):
+                _lookup_ok = True
                 if c.get("custom_fields"):
                     cf = {**cf, **c["custom_fields"]}
                     report["source"] = "ghl_contact"
@@ -4999,6 +5040,13 @@ async def hydrate_form_facts(contact_id: str,
                     state["address"] = c["address"]
             else:
                 report["reason"] = "contact_lookup_failed"
+
+            # A CONFIRMED absence, and only that, is worth remembering. When
+            # the lookup failed we learned nothing, so the next message tries
+            # again rather than inheriting a conclusion we never reached.
+            if _lookup_ok and not _has_any_form_field(cf):
+                _remember_no_form_fields(contact_id)
+                ev("FORM_FIELDS_ABSENT_CACHED", contact_id)
 
         if not cf:
             report["reason"] = report["reason"] or "no_custom_fields"
@@ -10523,6 +10571,13 @@ async def debug_reset_contact(request: Request):
 
     if contact_id and _contact_last_processed_ts.pop(contact_id, None) is not None:
         cleared["_contact_last_processed_ts"] = 1
+
+    # [FORM-AWARE] Reset purges every other per-contact cache, so it must
+    # purge this one too — otherwise a reset issued right after adding the
+    # form fields in GHL would still refuse to re-read them.
+    if contact_id and contact_id in _no_form_fields:
+        _no_form_fields.discard(contact_id)
+        cleared["_no_form_fields"] = 1
 
     # Only drop a lock that is NOT currently held — removing a held lock would
     # let a concurrent in-flight webhook for this contact lose mutual exclusion.
