@@ -7778,6 +7778,45 @@ def resolve_ghl_tags(stage: Stage, qualified: bool = True) -> list[str]:
 #  INBOUND WEBHOOK  (GHL → Michael)
 # ─────────────────────────────────────────────
 
+async def persist_booking_link_sent(contact_id: str, message: str,
+                                    send_result: dict | None) -> bool:
+    """
+    [BOOKING-2] Write the durable BOOKING_LINK_SENT marker when an outreach
+    carried the calendar AND the send was accepted.
+
+    WHY
+      The qualified V2 opener now contains the calendar link, but the only
+      tag written after it was ai-outreach-sent. restore_stage_from_ghl()
+      maps that to ASK_OWNERSHIP, so a Render restart erased the knowledge
+      that the link had already gone out - the contact came back looking
+      like an un-pitched lead.
+
+    ACCEPTED SENDS ONLY
+      A suppressed or rejected send must never leave this marker behind, or
+      a lead whose message never left would be recorded as pitched and
+      never receive the calendar at all. Same discipline as
+      ai-outreach-sent: the caller has already confirmed delivery, and this
+      re-checks rather than trusting it.
+
+    Additive and non-fatal: a tag failure must never cost the reply that
+    was already sent successfully.
+    """
+    if not (contact_id and opener_carries_booking_link(message)):
+        return False
+    if (send_result or {}).get("status") not in _STATUS_ADVANCES_STATE:
+        return False
+    try:
+        _ok = await add_ghl_tags(
+            contact_id, resolve_ghl_tags(Stage.SEND_BOOKING, qualified=True))
+        ev("BOOKING_LINK_SENT_PERSISTED", contact_id, ok=_ok,
+           via="qualified_opener")
+        return _ok
+    except Exception as err:
+        log.warning(f"[{contact_id}] BOOKING_LINK_SENT tag write failed "
+                    f"(non-fatal): {err}")
+        return False
+
+
 @app.post("/webhook/inbound")
 async def inbound_webhook(request: Request):
     """
@@ -9444,6 +9483,9 @@ async def inbound_webhook(request: Request):
                 # (which would also start the GHL nurture sequence).
                 try:
                     await add_ghl_tags(contact_id, [TAG_OUTREACH_SENT])
+                    # [BOOKING-2] The qualified opener carried the calendar,
+                    # so record that durably too or a restart forgets it.
+                    await persist_booking_link_sent(contact_id, outreach, _send)
                 except Exception as _ot_err:
                     log.warning(f"[{contact_id}] outreach tag write failed (non-fatal): {_ot_err}")
                 ev(
@@ -9679,6 +9721,9 @@ async def inbound_webhook(request: Request):
                        reason=_send.get("reason") or _send.get("why") or "(none)")
                 else:
                     _record_send_result(contact_id, state, _send)
+                    # [BOOKING-2] Persist the marker if this opener carried
+                    # the calendar. No-op when it did not.
+                    await persist_booking_link_sent(contact_id, outreach, _send)
                     ev("FIRST_OUTREACH_SENT", contact_id, path="real_message",
                        status=_send.get("status"),
                        message_id=_send.get("message_id") or "(none)")
@@ -11088,6 +11133,9 @@ async def after_hours_resume(request: Request):
 
     await clear_after_hours_hold(contact_id)
     _qh_stats["resumes_sent"] += 1
+    # [BOOKING-2] An overnight V2 lead resumed in the morning gets the same
+    # link-bearing opener, so it needs the same durable marker.
+    await persist_booking_link_sent(contact_id, reply, _send)
     ev("QH_RESUME_SENT", contact_id, message_id=_send.get("message_id") or "(none)")
     return JSONResponse({"status": "success", "sms_sent": True,
                          "message_id": _send.get("message_id", ""),

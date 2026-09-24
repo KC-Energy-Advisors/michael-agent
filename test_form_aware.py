@@ -1783,5 +1783,276 @@ class Test27_OneMessageBooking(FormAwareTestCase):
         self.assertIsNone(ma.michael_agent("b1", "either"))
 
 
+class Test28_RestartDurability(FormAwareTestCase):
+    """
+    [DURABILITY] A Meta V2 lead answers the three questions BEFORE Michael
+    texts. Those answers live in GHL custom fields, which outlive the Render
+    process. A restart must never make Michael re-ask them.
+
+    The restart path is: _state_store is empty -> /webhook/inbound ->
+    hydrate_form_facts() runs BEFORE any routing or michael_agent() call ->
+    facts are back in state -> qualification_verdict() is correct again.
+    """
+
+    def _restart(self):
+        """Simulate a Render restart: every process-local cache is gone."""
+        ma._state_store.clear()
+        ma._no_form_fields.clear()
+        ma._processed_event_ids.clear()
+        ma._outbound_fingerprints.clear()
+
+    def _rehydrate(self, cid="v2", cf=None, address="1423 Oak Street"):
+        self.stub_contact(cf if cf is not None else QUALIFIED_FORM, address)
+        state = ma.get_state(cid)
+        report = run(ma.hydrate_form_facts(cid, state))
+        return state, report
+
+    # 1. fully qualified -> restart -> still QUALIFIED, nothing re-asked
+    def test_1_fully_qualified_survives_a_restart(self):
+        self._restart()
+        state, report = self._rehydrate()
+        self.assertTrue(report["ran"])
+        self.assertEqual(state["q_homeowner"], ma.QUAL_YES)
+        self.assertEqual(state["q_utility"], ma.UTIL_AMEREN)
+        self.assertEqual(state["q_bill_100_plus"], ma.QUAL_YES)
+        self.assertEqual(ma.qualification_verdict(state)[0], ma.VERDICT_QUALIFIED)
+
+    def test_1b_no_qualification_question_is_re_asked_after_restart(self):
+        self._restart()
+        state, _ = self._rehydrate()
+        low = ma.build_new_contact_outreach(first_name="Sarah", state=state).lower()
+        for banned in ("are you the homeowner", "own the home", "ameren",
+                       "electric bill", "bill running"):
+            self.assertNotIn(banned, low, banned)
+
+    def test_1c_the_record_is_rebuilt_from_GHL_not_memory(self):
+        self._restart()
+        fresh = ma.get_state("v2")
+        self.assertEqual(fresh["q_homeowner"], ma.QUAL_UNKNOWN)   # memory gone
+        state, _ = self._rehydrate()
+        self.assertEqual(state["q_homeowner"], ma.QUAL_YES)        # GHL restored
+
+    # 2. partially qualified -> restart -> asks ONLY the missing field
+    def test_2_partial_restart_asks_only_the_missing_bill(self):
+        self._restart()
+        state, _ = self._rehydrate(
+            cf=form_fields(homeowner="Yes", utility="Ameren Missouri"))
+        self.assertEqual(ma.qualification_verdict(state)[1], [ma.Q_BILL])
+        low = ma.build_new_contact_outreach(first_name="S", state=state).lower()
+        self.assertIn("bill", low)
+        self.assertNotIn("ameren", low)
+        self.assertNotIn("homeowner", low)
+
+    def test_2b_partial_restart_asks_only_the_missing_utility(self):
+        self._restart()
+        state, _ = self._rehydrate(
+            cf=form_fields(homeowner="Yes", bill="$150-$199"))
+        self.assertEqual(ma.qualification_verdict(state)[1], [ma.Q_UTILITY])
+        low = ma.build_new_contact_outreach(first_name="S", state=state).lower()
+        self.assertIn("ameren", low)
+        self.assertNotIn("homeowner", low)
+        self.assertNotIn("bill", low)
+
+    def test_2c_partial_restart_asks_only_the_missing_homeowner(self):
+        self._restart()
+        state, _ = self._rehydrate(
+            cf=form_fields(bill="$150-$199", utility="Ameren Missouri"))
+        self.assertEqual(ma.qualification_verdict(state)[1], [ma.Q_HOMEOWNER])
+        low = ma.build_new_contact_outreach(first_name="S", state=state).lower()
+        self.assertIn("homeowner", low)
+        self.assertNotIn("ameren", low)
+        self.assertNotIn("bill", low)
+
+    # 3. explicit corrections and precedence survive rehydration
+    def test_3_an_explicit_correction_is_not_undone_by_rehydration(self):
+        self._restart()
+        state, _ = self._rehydrate()
+        ma.apply_qualification_facts(
+            state, ma.extract_qualification_facts("Actually I rent"), "v2")
+        self.assertEqual(state["q_homeowner"], ma.QUAL_NO)
+        # A later re-fetch of the SAME form field must not resurrect "yes".
+        run(ma.hydrate_form_facts("v2", state))
+        self.assertEqual(state["q_homeowner"], ma.QUAL_NO)
+        self.assertEqual(ma.qualification_verdict(state)[0], ma.VERDICT_DISQUALIFIED)
+
+    def test_3b_form_precedence_is_unchanged_after_restart(self):
+        self._restart()
+        state, _ = self._rehydrate()
+        # form is the LOWEST tier and cannot overwrite an explicit answer
+        state["q_utility"] = ma.UTIL_OTHER
+        ma.apply_qualification_facts(
+            state, ma.facts_from_form_fields(QUALIFIED_FORM), "v2")
+        self.assertEqual(state["q_utility"], ma.UTIL_OTHER)
+
+    # 4. BOOKING_LINK_SENT and the facts survive INDEPENDENTLY
+    def test_4_booking_link_tag_restores_the_stage(self):
+        stage, why = ma.restore_stage_from_ghl(
+            ["source-fb-paid", "meta-lead", "ai-outreach-sent",
+             "QUALIFIED", "BOOKING_LINK_SENT"])
+        self.assertEqual(stage, ma.Stage.SEND_BOOKING)
+        self.assertIn("qualified", why)
+
+    def test_4b_outreach_tag_alone_does_NOT_imply_the_link_went_out(self):
+        # The exact bug: ai-outreach-sent restores only to ASK_OWNERSHIP.
+        stage, _ = ma.restore_stage_from_ghl(["ai-outreach-sent"])
+        self.assertEqual(stage, ma.Stage.ASK_OWNERSHIP)
+
+    def test_4c_facts_and_stage_restore_independently(self):
+        self._restart()
+        state, _ = self._rehydrate()                       # facts from fields
+        ma.apply_restored_stage("v2", state,
+                                ["ai-outreach-sent", "QUALIFIED",
+                                 "BOOKING_LINK_SENT"], "")  # stage from tags
+        self.assertEqual(state["stage"], ma.Stage.SEND_BOOKING)
+        self.assertEqual(state["q_homeowner"], ma.QUAL_YES)
+        self.assertEqual(state["q_utility"], ma.UTIL_AMEREN)
+        self.assertEqual(state["q_bill_100_plus"], ma.QUAL_YES)
+
+    # 5. link already sent -> restart -> no questions AND no duplicate link
+    def test_5_restart_after_link_sent_asks_nothing_and_resends_nothing(self):
+        self._restart()
+        state, _ = self._rehydrate()
+        ma.apply_restored_stage("v2", state,
+                                ["ai-outreach-sent", "QUALIFIED",
+                                 "BOOKING_LINK_SENT"], "")
+        ma.save_state("v2", state)
+        self.assertEqual(state["stage"], ma.Stage.SEND_BOOKING)
+        self.assertTrue(state.get("qualified"))
+        # First outreach is suppressed for a contact already carrying the tags
+        self.assertTrue(ma.has_tag(["ai-outreach-sent"], ma.TAG_OUTREACH_SENT))
+
+    def test_5b_a_restored_contact_is_not_walked_back_into_qualification(self):
+        self._restart()
+        state, _ = self._rehydrate()
+        ma.apply_restored_stage("v2", state,
+                                ["ai-outreach-sent", "QUALIFIED",
+                                 "BOOKING_LINK_SENT"], "")
+        self.assertEqual(ma.qualification_verdict(state)[1], [])
+
+    # 6. booked lead -> restart -> lockout wins, nothing generated
+    def test_6_booked_lockout_survives_a_restart(self):
+        self._restart()
+        state, _ = self._rehydrate()
+        ma.apply_restored_stage("v2", state, ["appointment booked"], "")
+        self.assertEqual(state["stage"], ma.Stage.BOOKED)
+
+    def test_6b_a_booked_contact_generates_no_conversion_messaging(self):
+        self._restart()
+        state, _ = self._rehydrate()
+        state["stage"] = ma.Stage.BOOKED
+        state["appointment_booked"] = True
+        ma.save_state("v2", state)
+        self.claude.reply_text = "Sure! [SEND_BOOKING]"
+        out = ma.michael_agent("v2", "sounds good")
+        self.assertNotIn(ma.BOOKING_LINK, out or "")
+
+    def test_6c_a_booked_contact_is_never_re_qualified(self):
+        self._restart()
+        state, _ = self._rehydrate(cf={})        # even with no form data
+        ma.apply_restored_stage("v2", state, ["appointment booked"], "")
+        self.assertEqual(state["stage"], ma.Stage.BOOKED)
+        self.assertEqual(ma.qualification_verdict(state)[0], ma.VERDICT_QUALIFIED)
+
+
+class Test29_BookingLinkSentPersistence(FormAwareTestCase):
+    """
+    [BOOKING-2] The qualified V2 opener carries the calendar, but only
+    ai-outreach-sent was written afterwards. restore_stage_from_ghl() maps
+    that to ASK_OWNERSHIP, so a restart forgot the link had gone out.
+    """
+
+    ACCEPTED = {"status": ma.SendStatus.ACCEPTED.value, "sent": True}
+
+    def setUp(self):
+        super().setUp()
+        self.written = []
+        async def _add(cid, tags):
+            self.written.append((cid, list(tags)))
+            return True
+        self._real_add = ma.add_ghl_tags
+        ma.add_ghl_tags = _add
+        self.addCleanup(lambda: setattr(ma, "add_ghl_tags", self._real_add))
+
+    def _opener(self):
+        state, _ = self.hydrate(custom_fields=QUALIFIED_FORM,
+                                address="1423 Oak Street")
+        return ma.build_new_contact_outreach(first_name="Sarah", state=state)
+
+    def test_a_qualified_opener_with_the_calendar_persists_the_marker(self):
+        msg = self._opener()
+        self.assertIn(ma.BOOKING_LINK, msg)
+        ok = run(ma.persist_booking_link_sent("c1", msg, self.ACCEPTED))
+        self.assertTrue(ok)
+        tags = [t for _, ts in self.written for t in ts]
+        self.assertIn("BOOKING_LINK_SENT", tags)
+        self.assertIn("QUALIFIED", tags)
+
+    def test_an_opener_without_a_link_persists_nothing(self):
+        ok = run(ma.persist_booking_link_sent(
+            "c1", "Quick question: are you on Ameren Missouri?", self.ACCEPTED))
+        self.assertFalse(ok)
+        self.assertEqual(self.written, [])
+
+    def test_a_FAILED_send_never_persists_the_marker(self):
+        msg = self._opener()
+        for bad in ({"status": ma.SendStatus.SUPPRESSED.value, "reason": "booked_guard"},
+                    {"status": ma.SendStatus.SUPPRESSED.value, "reason": "compliance_dnd"},
+                    {"status": ma.SendStatus.SUPPRESSED.value, "reason": "outside_send_window"},
+                    {"status": ma.SendStatus.REJECTED.value},
+                    {"status": ma.SendStatus.NOT_ATTEMPTED.value},
+                    {}, None):
+            with self.subTest(result=bad):
+                self.written.clear()
+                self.assertFalse(run(ma.persist_booking_link_sent("c1", msg, bad)))
+                self.assertEqual(self.written, [])
+
+    def test_a_tag_write_failure_is_non_fatal(self):
+        async def _boom(cid, tags):
+            raise RuntimeError("GHL down")
+        ma.add_ghl_tags = _boom
+        self.assertFalse(
+            run(ma.persist_booking_link_sent("c1", self._opener(), self.ACCEPTED)))
+
+    def test_an_empty_contact_id_persists_nothing(self):
+        self.assertFalse(
+            run(ma.persist_booking_link_sent("", self._opener(), self.ACCEPTED)))
+
+    def test_after_restart_the_marker_restores_the_booking_stage(self):
+        # What GHL now holds after a successful qualified opener.
+        tags = ["source-fb-paid", "meta-lead", "ai-outreach-sent",
+                "QUALIFIED", "BOOKING_LINK_SENT"]
+        stage, why = ma.restore_stage_from_ghl(tags)
+        self.assertEqual(stage, ma.Stage.SEND_BOOKING)
+
+    def test_the_restored_contact_is_marked_qualified_and_link_sent(self):
+        ma._state_store.clear()
+        state = ma.get_state("r")
+        ma.apply_restored_stage("r", state,
+                                ["ai-outreach-sent", "QUALIFIED",
+                                 "BOOKING_LINK_SENT"], "")
+        self.assertEqual(state["stage"], ma.Stage.SEND_BOOKING)
+        self.assertTrue(state.get("qualified"))
+        self.assertTrue(state.get("booking_detected"))
+
+    def test_without_the_patch_behaviour_the_stage_would_regress(self):
+        # Pins the exact defect: outreach tag alone loses the link knowledge.
+        self.assertEqual(
+            ma.restore_stage_from_ghl(["ai-outreach-sent"])[0],
+            ma.Stage.ASK_OWNERSHIP)
+        self.assertEqual(
+            ma.restore_stage_from_ghl(
+                ["ai-outreach-sent", "BOOKING_LINK_SENT"])[0],
+            ma.Stage.SEND_BOOKING)
+
+    def test_a_repeat_opener_is_suppressed_for_an_outreached_contact(self):
+        # The existing first-outreach guard still prevents a second opener.
+        self.assertTrue(ma.has_tag(["ai-outreach-sent"], ma.TAG_OUTREACH_SENT))
+
+    def test_the_opener_itself_is_unchanged_by_this_patch(self):
+        msg = self._opener()
+        self.assertIn(ma.BOOKING_LINK, msg)
+        self.assertNotIn("want me to", msg.lower())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
