@@ -3293,6 +3293,12 @@ IN_NONE            = "none"
 
 # Actions.
 ACT_SEND_BOOKING   = "send_booking_link"
+
+# [BOOKING-1] Outbound types that are an OPEN qualification question. A hedged
+# reply to one of these is an unanswered question, not booking intent.
+_QUALIFICATION_QUESTIONS: frozenset = frozenset({
+    "ownership_question", "utility_provider_question", "bill_amount_question",
+})
 ACT_CONTINUE_QUAL  = "continue_qualification"
 ACT_ASK_MISSING    = "ask_missing_criterion"
 ACT_NO_OVERRIDE    = "no_override"
@@ -3452,6 +3458,50 @@ def is_affirmative_reply(text: str) -> bool:
     return bool(_AFFIRMATIVE_ONLY_RE.match(t))
 
 
+# ── [BOOKING-1] Short COOPERATIVE replies ────────────────────────────────
+# "either", "both", "I guess", "maybe", "whatever works" are go-aheads in
+# substance but not affirmations in grammar, so _AFFIRM_TOKEN never matched
+# them and a willing lead fell through to the generic path.
+#
+# Deliberately a SEPARATE detector rather than new _AFFIRM_TOKEN entries.
+# is_affirmative_reply() is what makes a bare reply CONFIRM qualification
+# facts (extract_qualification_facts -> `bare`), so adding "maybe" or "I
+# guess" there would let a hedge silently assert that someone owns their
+# home. This function is read only by the booking-advance decision and can
+# never write a qualification fact.
+_COOPERATIVE_ONLY_RE = re.compile(
+    r"^\s*(?:"
+    r"either|either\s+one|either\s+is\s+fine|either\s+works"
+    r"|both|both\s+work|both\s+are\s+fine"
+    r"|i\s+guess|guess\s+so|i\s+suppose|suppose\s+so"
+    r"|maybe|possibly|probably"
+    r"|fine|that'?s\s+fine|fine\s+by\s+me"
+    r"|that'?s\s+right|thats\s+right|correct"
+    r"|whatever\s+works|whatever'?s\s+easiest|up\s+to\s+you|your\s+call"
+    r"|doesn'?t\s+matter|don'?t\s+care|no\s+preference"
+    r"|sounds\s+fine|sounds\s+ok(?:ay)?|works"
+    r")[\s,.!?]*$",
+    re.IGNORECASE,
+)
+
+
+def is_cooperative_reply(text: str) -> bool:
+    """
+    True for a short go-ahead that is not grammatically an affirmative.
+
+    Booking-advance only. Never used to establish a qualification fact.
+    """
+    t = (text or "").strip()
+    if not t or len(t) > 40:
+        return False
+    # The pattern is a fully anchored allowlist, so a match IS one of the
+    # listed go-aheads. It is checked BEFORE the negation filter because
+    # several of them are built from negation words — "doesn't matter",
+    # "don't care", "no preference" — which that filter would reject.
+    # Anything not on the list ("maybe not", "no thanks") cannot match.
+    return bool(_COOPERATIVE_ONLY_RE.match(t))
+
+
 # ── Explicit call / scheduling requests ──────────────────────────────────
 # These are self-evident regardless of what we said last, so they outrank the
 # affirmative logic entirely. A lead who says "just call me" has already told
@@ -3569,6 +3619,24 @@ def last_outbound_message(state: dict) -> str:
     return ""
 
 
+def may_advance_on_cooperation(state: dict, prev_type: str,
+                              verdict: str) -> tuple[bool, int]:
+    """
+    [BOOKING-1] (may_advance, confirmed_count) for a short go-ahead.
+
+    Two guards, shared by every cooperative path so they cannot drift:
+      * at least one criterion confirmed - the same bar as branch D2, so a
+        lead we know nothing about still cannot pull the link
+      * not hedging on an OPEN qualification question - "maybe" answering
+        "are you the homeowner?" is an unanswered question, not booking
+        intent, unless the record is already complete
+    """
+    confirmed = confirmed_criteria_count(state)
+    hedging = (prev_type in _QUALIFICATION_QUESTIONS
+               and verdict != VERDICT_QUALIFIED)
+    return (confirmed >= 1 and not hedging), confirmed
+
+
 def decide_conversion_action(state: dict,
                              inbound_text: str,
                              prior_outbound: str = "") -> ConversionDecision:
@@ -3651,6 +3719,25 @@ def decide_conversion_action(state: dict,
             )
 
     if not _affirmative:
+        # ── F [BOOKING-1]: a short cooperative go-ahead ──────────────
+        # "either" / "both" / "I guess" are willingness, and making a
+        # willing lead send a second text just to receive the calendar is
+        # pure friction. Send the link in THIS reply instead.
+        #
+        # Two guards keep it honest:
+        #   * at least one criterion confirmed - same bar as branch D2, so
+        #     a lead we know nothing about still cannot pull the link
+        #   * not a hedge on an open qualification question - "maybe" to
+        #     "are you the homeowner?" is an unanswered question, not
+        #     booking intent, unless the record is already complete
+        _ok, _confirmed = may_advance_on_cooperation(state, prev_type, verdict)
+        if is_cooperative_reply(inbound_text) and _ok:
+            return ConversionDecision(
+                IN_HIGH_INTENT, prev_type, ACT_SEND_BOOKING,
+                f"cooperative reply — advancing with the link "
+                f"({_confirmed}/3 criteria confirmed)",
+            )
+
         return ConversionDecision(
             IN_NONE, prev_type, ACT_NO_OVERRIDE,
             # [GAP-2] Name the gate when it is what held the link back, so the
@@ -3715,6 +3802,17 @@ def decide_conversion_action(state: dict,
     # Deliberately NOT treated as high intent. Guessing here is exactly how a
     # lead who said yes to "are you on Ameren?" would get a booking link
     # instead of the next qualification question.
+    # [BOOKING-1] Before dead-ending: an affirmative from a lead who is
+    # already qualified enough is a go-ahead. Making them text again purely
+    # to receive the calendar is the friction this change exists to remove.
+    _ok, _confirmed = may_advance_on_cooperation(state, prev_type, verdict)
+    if _ok:
+        return ConversionDecision(
+            IN_HIGH_INTENT, prev_type, ACT_SEND_BOOKING,
+            f"affirmative from a sufficiently qualified lead — advancing "
+            f"with the link ({_confirmed}/3 criteria confirmed)",
+        )
+
     return ConversionDecision(
         IN_AMBIG_AFFIRM, prev_type, ACT_NO_OVERRIDE,
         "affirmative but no conversion-invitation evidence — normal flow",
@@ -5880,6 +5978,16 @@ def street_hint(address: str) -> str:
     return name.title()
 
 
+def opener_carries_booking_link(text: str) -> bool:
+    """
+    [BOOKING-1] True when a first-outreach message already contains the
+    calendar link, so the caller advances to SEND_BOOKING instead of
+    ASK_OWNERSHIP. Without this the next affirmative reads as an affirmative
+    to a booking pitch and the link goes out twice.
+    """
+    return bool(text) and BOOKING_LINK in text
+
+
 def build_new_contact_outreach(
     first_name:  str = "",
     full_name:   str = "",
@@ -5927,12 +6035,25 @@ def build_new_contact_outreach(
         )
 
         if _verdict == VERDICT_QUALIFIED:
-            # Everything we need is already known. Do NOT re-ask any of it.
+            # Everything we need is already known. Do NOT re-ask any of it —
+            # and do NOT ask permission to send the calendar either.
+            #
+            # [BOOKING-1] This used to end "Want me to put that together?",
+            # which made an already-qualified homeowner send a second text
+            # purely to receive a link we were always going to send. They
+            # filled in the form and every criterion passed; booking IS the
+            # next step, so the link travels in this message.
+            #
+            # Callers must advance the stage to SEND_BOOKING when the opener
+            # carries the link (see opener_carries_booking_link) or the next
+            # affirmative would classify this as a booking pitch and send the
+            # link a second time.
             return (
                 f"{_got_it}\n"
-                f"Looks like your place is worth a proper look — I can run "
-                f"the numbers and show you what the savings actually come out "
-                f"to. Want me to put that together?"
+                f"I can show you what the numbers actually look like and answer "
+                f"any questions while we're at it. Here's my calendar if you "
+                f"want to grab a time that works best for you:\n"
+                f"{BOOKING_LINK}"
             )
 
         if _missing == [Q_UTILITY] and state.get("q_utility") == UTIL_PENDING:
@@ -9262,7 +9383,9 @@ async def inbound_webhook(request: Request):
                 # [DELIVERY] Snapshot first so the advance is reversible when the
                 # message turns out never to have left.
                 _snap = _snapshot_conversation(state)
-                state["stage"]              = Stage.ASK_OWNERSHIP
+                state["stage"]              = (Stage.SEND_BOOKING
+                                               if opener_carries_booking_link(outreach)
+                                               else Stage.ASK_OWNERSHIP)
                 state["location_confirmed"] = True  # address from form → skip area question
                 increment_message_count(state)
                 # Prepend synthetic user context so history is valid for Anthropic API
@@ -9526,7 +9649,9 @@ async def inbound_webhook(request: Request):
             # Stamp state before async send — race-condition safe
             state["entry_path"]         = state.get("entry_path") or "chat_widget"
             state["source_chat_widget"] = True
-            state["stage"]              = Stage.ASK_OWNERSHIP
+            state["stage"]              = (Stage.SEND_BOOKING
+                                           if opener_carries_booking_link(outreach)
+                                           else Stage.ASK_OWNERSHIP)
             state["location_confirmed"] = True   # address submitted → area implicitly confirmed
             if not state.get("lead_source") and lead_source:
                 state["lead_source"] = lead_source
@@ -9835,7 +9960,9 @@ async def inbound_webhook(request: Request):
                     return JSONResponse({"status": "success", "skipped": True,
                                          "reason": "form_disqualified",
                                          "contact_id": contact_id})
-                _fb_state["stage"]              = Stage.ASK_OWNERSHIP
+                _fb_state["stage"]              = (Stage.SEND_BOOKING
+                                                   if opener_carries_booking_link(_fb_outreach)
+                                                   else Stage.ASK_OWNERSHIP)
                 _fb_state["location_confirmed"] = True
                 _fb_state["entry_path"]         = _fb_state.get("entry_path") or "chat_widget"
                 _fb_state["source_chat_widget"] = True
@@ -10890,7 +11017,9 @@ async def after_hours_resume(request: Request):
                 return _skip("form_disqualified", hold_cleared=True)
             _kind = SendKind.OUTREACH
             if state.get("stage") == Stage.INITIAL:
-                state["stage"] = Stage.ASK_OWNERSHIP
+                state["stage"] = (Stage.SEND_BOOKING
+                                  if opener_carries_booking_link(reply)
+                                  else Stage.ASK_OWNERSHIP)
             increment_message_count(state)
             state["messages"].append({
                 "role": "user",
