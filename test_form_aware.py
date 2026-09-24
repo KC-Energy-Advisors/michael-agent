@@ -85,6 +85,7 @@ class FormAwareTestCase(unittest.TestCase):
 
     def setUp(self):
         ma._state_store.clear()
+        ma._no_form_fields.clear()      # per-contact cache: isolate per test
         self._real_claude = ma.claude
         self._real_flag   = ma.FORM_AWARE_ENABLED
         self._real_fetch  = ma.fetch_ghl_contact_compliance
@@ -104,6 +105,7 @@ class FormAwareTestCase(unittest.TestCase):
         ma.UTILITY_ELIGIBLE.clear()
         ma.UTILITY_ELIGIBLE.update(self._real_elig)
         ma._state_store.clear()
+        ma._no_form_fields.clear()
 
     def stub_contact(self, custom_fields=None, address="", tags=None, ok=True):
         """Make the GHL contact record return these form answers."""
@@ -1586,6 +1588,199 @@ class Test26_NoFormFieldsNegativeCache(FormAwareTestCase):
         run(ma.hydrate_form_facts("off", ma.get_state("off")))
         self.assertEqual(len(calls), 0)
         self.assertEqual(ma._no_form_fields, set())
+
+
+class Test27_OneMessageBooking(FormAwareTestCase):
+    """
+    [BOOKING-1] Michael used to ask permission to send the calendar and then
+    send it on the next turn. A qualified homeowner had to send an extra text
+    purely to receive a link we were always going to send.
+
+    Now the link travels in the same message as the offer - but only when the
+    lead is sufficiently qualified, and never when they are hedging on an
+    open qualification question.
+    """
+
+    COOPERATIVE = ["either", "both", "I guess", "maybe", "whatever works",
+                   "fine", "that's right", "doesn't matter", "up to you",
+                   "no preference", "don't care", "either one", "suppose so"]
+    AFFIRMATIVE = ["sure", "yeah", "okay", "sounds good", "yes", "works"]
+    NEVER = ["not interested", "no", "maybe not", "no thanks", "stop",
+             "who is this", "how much does it cost", "is this a scam",
+             "take me off your list", "I rent"]
+
+    def _state(self, prior="Morning or afternoon usually better?", **fields):
+        ma._state_store.clear()
+        s = ma.get_state("b1")
+        s.update(fields)
+        s["messages"] = [{"role": "user", "content": "hi"},
+                         {"role": "assistant", "content": prior}]
+        return s
+
+    def _qualified_enough(self, **extra):
+        f = {"q_homeowner": ma.QUAL_YES, "q_utility": ma.UTIL_AMEREN}
+        f.update(extra)
+        return self._state(**f)
+
+    # -- the opener no longer asks permission ---------------------
+    def test_the_qualified_opener_contains_the_link(self):
+        state, _ = self.hydrate(custom_fields=QUALIFIED_FORM,
+                                address="1423 Oak Street, Chesterfield MO")
+        msg = ma.build_new_contact_outreach(first_name="Sarah", state=state)
+        self.assertIn(ma.BOOKING_LINK, msg)
+
+    def test_the_qualified_opener_asks_no_permission(self):
+        state, _ = self.hydrate(custom_fields=QUALIFIED_FORM)
+        msg = ma.build_new_contact_outreach(first_name="Sarah", state=state)
+        low = msg.lower()
+        for phrase in ("want me to", "should i", "would you like me to",
+                       "shall i", "do you want"):
+            self.assertNotIn(phrase, low, phrase)
+
+    def test_the_qualified_opener_still_asks_no_qualification_questions(self):
+        state, _ = self.hydrate(custom_fields=QUALIFIED_FORM)
+        low = ma.build_new_contact_outreach(first_name="Sarah", state=state).lower()
+        for k in ("ameren", "homeowner", "own the home", "bill"):
+            self.assertNotIn(k, low, k)
+
+    def test_openers_that_still_need_information_carry_NO_link(self):
+        # Only a fully qualified lead gets the link unprompted.
+        for cf in (form_fields(homeowner="Yes", utility="Ameren Missouri"),
+                   form_fields(homeowner="Yes", bill="$150-$199"),
+                   form_fields(homeowner="Yes", bill="$300+",
+                               utility="Another Electric Provider"),
+                   {}):
+            with self.subTest(cf=cf):
+                ma._state_store.clear()
+                ma._no_form_fields.clear()
+                state, _ = self.hydrate(custom_fields=cf)
+                msg = ma.build_new_contact_outreach(first_name="S", state=state)
+                self.assertNotIn(ma.BOOKING_LINK, msg)
+
+    def test_a_disqualified_lead_still_gets_nothing(self):
+        state, _ = self.hydrate(
+            custom_fields=form_fields("No", "$300+", "Ameren Missouri"))
+        self.assertEqual(
+            ma.build_new_contact_outreach(first_name="S", state=state), "")
+
+    def test_opener_carries_booking_link_helper(self):
+        self.assertTrue(ma.opener_carries_booking_link(f"hi {ma.BOOKING_LINK}"))
+        self.assertFalse(ma.opener_carries_booking_link("hi there"))
+        self.assertFalse(ma.opener_carries_booking_link(""))
+
+    def test_a_link_bearing_opener_classifies_as_a_booking_pitch(self):
+        # This is WHY the caller must advance the stage - otherwise the next
+        # affirmative reads as a yes to a pitch and the link goes out twice.
+        state, _ = self.hydrate(custom_fields=QUALIFIED_FORM)
+        msg = ma.build_new_contact_outreach(first_name="Sarah", state=state)
+        self.assertEqual(ma.classify_outbound_intent(msg), ma.OUT_BOOKING_PITCH)
+
+    # -- cooperative replies advance ------------------------------
+    def test_cooperative_replies_are_detected(self):
+        for w in self.COOPERATIVE:
+            with self.subTest(text=w):
+                self.assertTrue(ma.is_cooperative_reply(w), w)
+
+    def test_cooperative_replies_advance_when_qualified_enough(self):
+        for w in self.COOPERATIVE:
+            with self.subTest(text=w):
+                d = ma.decide_conversion_action(self._qualified_enough(), w)
+                self.assertEqual(d.action, ma.ACT_SEND_BOOKING, w)
+
+    def test_affirmatives_also_advance_when_qualified_enough(self):
+        for w in self.AFFIRMATIVE:
+            with self.subTest(text=w):
+                d = ma.decide_conversion_action(self._qualified_enough(), w)
+                self.assertEqual(d.action, ma.ACT_SEND_BOOKING, w)
+
+    def test_negations_built_into_go_aheads_still_count(self):
+        # "doesn't matter" / "no preference" are cooperation, not refusal.
+        for w in ("doesn't matter", "don't care", "no preference"):
+            with self.subTest(text=w):
+                self.assertTrue(ma.is_cooperative_reply(w), w)
+
+    # -- guards ---------------------------------------------------
+    def test_nothing_confirmed_means_no_link(self):
+        for w in self.COOPERATIVE + self.AFFIRMATIVE:
+            with self.subTest(text=w):
+                d = ma.decide_conversion_action(self._state(), w)
+                self.assertNotEqual(d.action, ma.ACT_SEND_BOOKING, w)
+
+    def test_hedging_on_an_open_qualification_question_does_not_advance(self):
+        for w in ("maybe", "I guess", "either", "whatever works"):
+            with self.subTest(text=w):
+                s = self._state(prior="What's your electric bill running most months?",
+                                q_homeowner=ma.QUAL_YES)
+                d = ma.decide_conversion_action(s, w)
+                self.assertNotEqual(d.action, ma.ACT_SEND_BOOKING, w)
+
+    def test_a_fully_qualified_lead_may_advance_even_after_a_question(self):
+        s = self._state(prior="What's your electric bill running most months?",
+                        q_homeowner=ma.QUAL_YES, q_utility=ma.UTIL_AMEREN,
+                        q_bill_100_plus=ma.QUAL_YES)
+        self.assertEqual(
+            ma.decide_conversion_action(s, "maybe").action, ma.ACT_SEND_BOOKING)
+
+    def test_a_disqualified_lead_never_advances(self):
+        for w in self.COOPERATIVE + self.AFFIRMATIVE:
+            with self.subTest(text=w):
+                s = self._qualified_enough(q_homeowner=ma.QUAL_NO)
+                self.assertEqual(
+                    ma.decide_conversion_action(s, w).action, ma.ACT_NO_OVERRIDE, w)
+
+    def test_pending_utility_alone_is_not_enough(self):
+        s = self._state(q_utility=ma.UTIL_PENDING)
+        self.assertNotEqual(
+            ma.decide_conversion_action(s, "either").action, ma.ACT_SEND_BOOKING)
+
+    def test_objections_and_questions_never_look_cooperative(self):
+        for w in self.NEVER:
+            with self.subTest(text=w):
+                self.assertFalse(ma.is_cooperative_reply(w), w)
+
+    def test_a_long_message_is_never_a_bare_cooperative_reply(self):
+        self.assertFalse(ma.is_cooperative_reply(
+            "maybe, but first I need to know how much this is going to cost me"))
+
+    # -- the critical separation: no fact confirmation ------------
+    def test_cooperative_words_NEVER_confirm_qualification_facts(self):
+        # This is why is_cooperative_reply is separate from
+        # is_affirmative_reply: a hedge must not assert homeownership.
+        for w in self.COOPERATIVE:
+            for prev in (ma.OUT_BUNDLED_QUAL, ma.OUT_OWNERSHIP_Q, ma.OUT_UTILITY_Q):
+                with self.subTest(text=w, prev=prev):
+                    facts = ma.extract_qualification_facts(w, previous_outbound_type=prev)
+                    self.assertNotIn(ma.Q_HOMEOWNER, facts, w)
+                    self.assertNotIn(ma.Q_UTILITY, facts, w)
+                    self.assertNotIn(ma.Q_BILL, facts, w)
+
+    def test_affirmative_fact_confirmation_is_unchanged(self):
+        # Pre-existing behaviour must not move.
+        f = ma.extract_qualification_facts("yes please", ma.OUT_BUNDLED_QUAL)
+        self.assertEqual(f[ma.Q_HOMEOWNER], ma.QUAL_YES)
+        self.assertEqual(f[ma.Q_UTILITY], ma.UTIL_AMEREN)
+        self.assertEqual(f[ma.Q_BILL], ma.QUAL_YES)
+
+    # -- end to end -----------------------------------------------
+    def test_one_message_not_two_for_a_cooperative_qualified_lead(self):
+        self.claude.reply_text = "Sounds good."
+        s = self._qualified_enough(q_bill_100_plus=ma.QUAL_YES,
+                                   stage=ma.Stage.ASK_BILL)
+        ma.save_state("b1", s)
+        out = ma.michael_agent("b1", "either")
+        self.assertIn(ma.BOOKING_LINK, out or "")
+
+    def test_booked_lockout_still_beats_a_cooperative_reply(self):
+        self.claude.reply_text = "Sure. [SEND_BOOKING]"
+        s = self._qualified_enough(stage=ma.Stage.BOOKED, appointment_booked=True)
+        ma.save_state("b1", s)
+        out = ma.michael_agent("b1", "either")
+        self.assertNotIn(ma.BOOKING_LINK, out or "")
+
+    def test_dnc_still_beats_a_cooperative_reply(self):
+        s = self._qualified_enough(stage=ma.Stage.DNC)
+        ma.save_state("b1", s)
+        self.assertIsNone(ma.michael_agent("b1", "either"))
 
 
 if __name__ == "__main__":
