@@ -747,6 +747,16 @@ TAG_NUDGE_SENT    = "booking-nudge-sent"
 #                  returns lastMessageType but no date and no direction, so
 #                  there is nothing to compare against. This tag is the signal.
 TAG_NUDGE_CANCELLED = "ai-nudge-cancelled"
+#   TAG_AI_PAUSED — HUMAN TAKEOVER. The owner adds it in GHL to silence
+#                  Michael for one contact WITHOUT opting them out. It is NOT
+#                  DNC: no DND is set, opt-outs still process, and booking
+#                  confirmations still go out. Removing it sends nothing; the
+#                  next NEW inbound resumes from the pre-pause state. Inbound
+#                  that arrives while paused is never added to history.
+TAG_AI_PAUSED = "ai-paused"
+AI_PAUSE_ENABLED = str(
+    os.getenv("AI_PAUSE_ENABLED", "true")
+).strip().lower() in ("1", "true", "yes", "on")
 
 # ── [DELIVERY-2] Carrier error taxonomy ──────────────────────────────────
 # Codes GHL surfaces through its "Messaging Error Code - SMS" workflow
@@ -851,6 +861,14 @@ _BOOKED_GUARDED: frozenset = frozenset({
     SendKind.QUALIFICATION,
     SendKind.BOOKING_PITCH,
     SendKind.NURTURE,
+})
+
+# [AI-PAUSE] Kinds that still go out while a human holds the conversation:
+# a STOP confirmation is a compliance obligation, and the booking
+# confirmation from /webhook/booking-followup is transactional.
+_AI_PAUSE_EXEMPT: frozenset = frozenset({
+    SendKind.OPT_OUT,
+    SendKind.BOOKED_REPLY,
 })
 
 
@@ -4691,6 +4709,7 @@ QH_MAX_HOLD_AGE_HOURS = 18
 # branch on `status not in _STATUS_ADVANCES_STATE`; these explain why.
 SUPPRESS_REASON_DND    = "compliance_dnd"
 SUPPRESS_REASON_WINDOW = "outside_send_window"
+SUPPRESS_REASON_AI_PAUSED = "ai_paused"
 
 # Process-local observability only. The AUTHORITATIVE queue is the GHL
 # tag; these reset on restart and are exposed via /health.
@@ -5288,7 +5307,37 @@ async def can_contact_sms(contact_id: str, state: dict | None = None) -> dict:
 
     return {"allowed": True, "reason": "no SMS DND on record",
             "category": "", "code": "", "permanent": False,
-            "phone": c["phone"], "email": c["email"]}
+            "phone": c["phone"], "email": c["email"],
+            # [AI-PAUSE] The same fresh read, surfaced so the send path can
+            # honour a human takeover without a second GHL call.
+            "tags": list(c.get("tags") or [])}
+
+
+async def resolve_ai_pause(contact_id: str, payload_tags: list | None,
+                           payload_has_tags: bool) -> tuple[str, list]:
+    """
+    [AI-PAUSE] Is a human currently holding this conversation?
+
+    Returns (state, tags) where state is:
+      "paused"  - TAG_AI_PAUSED is on the contact
+      "active"  - it is not
+      "unknown" - the live read failed AND the webhook carried no tags
+
+    A fresh GHL read wins, because the owner may have added the tag after
+    the webhook fired. If that read fails, the tags GHL put in the webhook
+    itself are the next-best truth. Only when neither exists is the state
+    unknown, and the caller treats unknown as paused (fail closed): the
+    send path would refuse to send without a working GHL read anyway, so
+    suppressing early loses no message and keeps state clean.
+    """
+    c = await fetch_ghl_contact_compliance(contact_id)
+    if c.get("ok"):
+        live = list(c.get("tags") or [])
+        return ("paused" if has_tag(live, TAG_AI_PAUSED) else "active"), live
+    if payload_has_tags:
+        tags = list(payload_tags or [])
+        return ("paused" if has_tag(tags, TAG_AI_PAUSED) else "active"), tags
+    return "unknown", list(payload_tags or [])
 
 
 async def record_sms_outcome(contact_id: str, category: str, code: str,
@@ -7507,6 +7556,34 @@ async def send_sms_via_ghl(contact_id: str, message: str, to_number: str = "",
         to_number = _gate["phone"]
 
     # ══════════════════════════════════════════════════════════════
+    #  [AI-PAUSE] Human takeover - defense in depth.
+    #
+    #  The inbound webhook already exits early for a paused contact; this
+    #  catches every OTHER automated path (nudge, resume, fallback) using
+    #  the fresh tags the compliance gate just read. After the compliance
+    #  gate on purpose, so a real opt-out is still refused and recorded
+    #  first; before the window gate on purpose, so a paused contact never
+    #  gets an after-hours hold. Exempt: STOP confirmations (compliance)
+    #  and booking confirmations (transactional, owner-approved).
+    # ══════════════════════════════════════════════════════════════
+    if (AI_PAUSE_ENABLED and kind not in _AI_PAUSE_EXEMPT
+            and has_tag(_gate.get("tags"), TAG_AI_PAUSED)):
+        ev("SEND_SUPPRESSED_AI_PAUSED", contact_id, kind=kind.value)
+        return {
+            "status"       : SendStatus.SUPPRESSED.value,
+            "accepted"     : False,
+            "delivered"    : None,
+            "message_id"   : "",
+            "sent"         : False,
+            "suppressed"   : True,
+            "reason"       : SUPPRESS_REASON_AI_PAUSED,
+            "why"          : "human takeover (ai-paused)",
+            "deduped"      : False,
+            "status_code"  : None,
+            "response_body": None,
+        }
+
+    # ══════════════════════════════════════════════════════════════
     #  [SEND-WINDOW-GATE] TCPA 9AM-9PM America/Chicago.
     #
     #  Placed here so EVERY outbound path is covered - outreach,
@@ -8279,6 +8356,34 @@ async def inbound_webhook(request: Request):
                 ev("DNC_RESTORED_FROM_TAG", contact_id, tag=TAG_DNC)
 
         # ══════════════════════════════════════════════════════════════
+        #  [AI-PAUSE] HUMAN TAKEOVER — resolve before any enrichment
+        #
+        #  After dedup, the lock and the DNC restore, so a duplicate is
+        #  still dropped first and an opted-out contact stays terminal.
+        #  A STOP-type message is NEVER blocked here: it continues down the
+        #  normal path so michael_agent()'s STOP handling runs unchanged.
+        #  The early exit itself happens after the engagement marker below,
+        #  so a paused reply still cancels GHL nurture.
+        # ══════════════════════════════════════════════════════════════
+        _ai_pause_block = False
+        _pause_state, _pause_tags = "active", list(tags or [])
+        if (AI_PAUSE_ENABLED and direction == "inbound"
+                and get_state(contact_id).get("stage") != Stage.DNC):
+            _payload_has_tags = (
+                body.get("tags") is not None or
+                (isinstance(body.get("contact"), dict)
+                 and body["contact"].get("tags") is not None)
+            )
+            _pause_state, _pause_tags = await resolve_ai_pause(
+                contact_id, tags, _payload_has_tags)
+            if _pause_state in ("paused", "unknown"):
+                if is_stop_request(parsed.get("message") or ""):
+                    ev("AI_PAUSED_OPT_OUT_PASSTHROUGH", contact_id,
+                       pause=_pause_state, event_id=_event_id or "(none)")
+                else:
+                    _ai_pause_block = True
+
+        # ══════════════════════════════════════════════════════════════
         #  [FORM-AWARE] META FORM FACT HYDRATION — before ALL routing
         #
         #  Placed here, after contact resolution and the processing lock and
@@ -8293,7 +8398,8 @@ async def inbound_webhook(request: Request):
         #  Sends nothing. Touches no gate. Inert when FORM_AWARE_ENABLED is
         #  off, and non-fatal in every failure mode.
         # ══════════════════════════════════════════════════════════════
-        if FORM_AWARE_ENABLED and get_state(contact_id).get("stage") != Stage.DNC:
+        if (FORM_AWARE_ENABLED and not _ai_pause_block
+                and get_state(contact_id).get("stage") != Stage.DNC):
             _fa_state  = get_state(contact_id)
             _fa_report = await hydrate_form_facts(contact_id, _fa_state, body=body)
             if _fa_report.get("ran"):
@@ -8350,6 +8456,39 @@ async def inbound_webhook(request: Request):
                         ev("NURTURE_CANCELLED_REPLY_RECEIVED", contact_id, tag=TAG_ENGAGED)
                 except Exception as _eng_err:
                     log.warning(f"[{contact_id}] engagement tag write failed (non-fatal): {_eng_err}")
+
+        # ══════════════════════════════════════════════════════════════
+        #  [AI-PAUSE] HUMAN TAKEOVER — exit before ANY routing or Claude
+        #
+        #  No Claude call, no SMS, no failsafe message, no history append:
+        #  the paused message never becomes conversation Michael owes a
+        #  reply to. The event id is already recorded by the dedup above, so
+        #  a retry of this webhook can never be processed later. An existing
+        #  after-hours hold is cleared so the morning ladder cannot answer a
+        #  paused-interval message. Returns 200 so GHL does not retry.
+        # ══════════════════════════════════════════════════════════════
+        if _ai_pause_block:
+            _hold_cleared = False
+            if has_tag(_pause_tags, TAG_AFTER_HOURS_HOLD):
+                try:
+                    _hold_cleared = await clear_after_hours_hold(contact_id)
+                except Exception as _hc_err:
+                    log.warning(f"[{contact_id}] pause hold clear failed (non-fatal): {_hc_err}")
+            _ps = get_state(contact_id)
+            _ps["ai_paused_last_suppressed_at"] = datetime.now(
+                tz=CENTRAL_TZ).isoformat(timespec="seconds")
+            _ps["ai_paused_last_event_id"] = _event_id or ""
+            save_state(contact_id, _ps)
+            _reason = "ai_paused" if _pause_state == "paused" else "ai_pause_state_unknown"
+            ev("AI_PAUSED_SUPPRESSED", contact_id, reason=_reason,
+               event_id=_event_id or "(none)", hold_cleared=_hold_cleared)
+            return JSONResponse({
+                "status"      : "success",
+                "skipped"     : True,
+                "reason"      : _reason,
+                "sms_sent"    : False,
+                "hold_cleared": _hold_cleared,
+            })
 
         # ══════════════════════════════════════════════════════════════
         #  PRIORITY ROUTING GUARDS  [FIX-7 / FIX-9]
@@ -10994,6 +11133,16 @@ async def after_hours_resume(request: Request):
                                  email=compliance.get("email", ""))
         await clear_after_hours_hold(contact_id)
         return _skip("dnd_active", category=_cat, code=_code, hold_cleared=True)
+
+    # ── 4b. Human takeover [AI-PAUSE] - clear, never send ─────────
+    # A hold placed before the owner paused the contact must not let
+    # Michael speak in the morning. Cleared (not retained) so the ladder
+    # stops and nothing fires later when the pause is lifted.
+    if AI_PAUSE_ENABLED and has_tag(compliance.get("tags"), TAG_AI_PAUSED):
+        await clear_after_hours_hold(contact_id)
+        ev("AI_PAUSED_SUPPRESSED", contact_id, reason="ai_paused",
+           path="after_hours_resume")
+        return _skip("ai_paused", hold_cleared=True)
 
     # ── 5. Booked lockout - reuse main's authoritative verdict ────
     _verdict, _why = await booked_verdict(contact_id)
