@@ -758,6 +758,14 @@ AI_PAUSE_ENABLED = str(
     os.getenv("AI_PAUSE_ENABLED", "true")
 ).strip().lower() in ("1", "true", "yes", "on")
 
+# [REOFFER-1] Kill switch for the booking-link re-offer behaviour (the
+# SEND_BOOKING-stage re-offer, the scheduling-promise backstop and the canned
+# install-time answer). false -> the pre-REOFFER-1 behaviour, except the
+# corrected install-vs-project-timeline facts, which stay in both prompts.
+BOOKING_REOFFER_ENABLED = str(
+    os.getenv("BOOKING_REOFFER_ENABLED", "true")
+).strip().lower() in ("1", "true", "yes", "on")
+
 # ── [DELIVERY-2] Carrier error taxonomy ──────────────────────────────────
 # Codes GHL surfaces through its "Messaging Error Code - SMS" workflow
 # trigger. PERMANENT means resending the same message to the same number
@@ -4157,7 +4165,18 @@ def build_system_prompt(state: dict, ghl_pipeline_stage: str = "", ghl_tags: lis
     _ask_one = ask_only if ask_only in _MISSING_FIELD_GUIDANCE else (
         _qual_missing[0] if len(_qual_missing) == 1 else ""
     )
-    if stage == Stage.SEND_BOOKING:
+    if stage == Stage.SEND_BOOKING and BOOKING_REOFFER_ENABLED:
+        # [REOFFER-1] Matches what the code now does at this stage: the tag
+        # makes code append the link to THIS reply (FIX-7 no longer drops it).
+        current_goal = (
+            "BOOKING — lead has the booking link and has not booked yet. "
+            "If they asked something, answer it in 1-2 sentences first. "
+            "Whenever you move toward scheduling (e.g. \"let's get you a time set\"), "
+            "end with [SEND_BOOKING] — code appends the booking link to this same "
+            "message. Never type a URL yourself. If you are only answering and not "
+            "moving to scheduling, omit the tag and do not promise the calendar."
+        )
+    elif stage == Stage.SEND_BOOKING:
         current_goal = (
             "BOOKING — lead is FULLY QUALIFIED. "
             "Write one natural transition sentence, then append [SEND_BOOKING]. "
@@ -4239,6 +4258,16 @@ def build_system_prompt(state: dict, ghl_pipeline_stage: str = "", ghl_tags: lis
             f"  A short reply from the homeowner is answering THIS. Read it that\n"
             f"  way before deciding what to say next.\n"
         )
+
+    # [REOFFER-1] One rule that matches the code: a scheduling transition and
+    # the [SEND_BOOKING] tag always travel together, and code supplies the URL.
+    _booking_link_rule = (
+        "SCHEDULING LANGUAGE AND THE LINK TRAVEL TOGETHER: any time you say things like "
+        "\"let me get you on the calendar\", \"grab a time\" or \"let's get you a time set\", "
+        "end that same reply with [SEND_BOOKING] — code then adds the booking link to it. "
+        "You never type the URL. Before they qualify, do not promise the calendar at all.\n"
+        if BOOKING_REOFFER_ENABLED else ""
+    )
 
     # ── GHL pipeline stage block ───────────────────────────────────
     _ghl_stage_line = ""
@@ -4333,6 +4362,16 @@ Example output: "Sounds good — let's find a time to come take a look. [SEND_BO
 IMPORTANT: If the lead asks ANY question (message contains "?") while qualifying — even right after giving
 their bill amount — ANSWER the question naturally in 1-2 sentences FIRST, then transition to booking.
 Never ignore a question by jumping straight to the booking invite.
+{_booking_link_rule}
+━━ INSTALL DAY VS. PROJECT TIMELINE — KEEP THEM SEPARATE ━━
+- The physical installation: most are done in one day; a bigger system sometimes takes two.
+  Never describe the installation itself as taking "1–3 days" or "a few days".
+- Permitting, Ameren interconnection approval, inspection and permission to operate (PTO) are
+  separate stages, not part of the install day. Permits + Ameren interconnection run about 3–4
+  weeks total. Bring these up only when relevant (they ask about the whole process, when the
+  system turns on, or when savings start). Never invent durations for inspection or PTO.
+- Asked how long installation takes: "Most installations get knocked out in one day. Depending
+  on the size of the system, sometimes two." Then move toward scheduling if they qualify.
 
 ━━ ONCE THEY REPLY — QUALIFYING MODE ━━
 The moment the homeowner has responded even once, your job is qualification and
@@ -6226,6 +6265,158 @@ def build_booking_nudge() -> str:
 
 
 # ─────────────────────────────────────────────
+#  BOOKING-LINK RE-OFFER  [REOFFER-1]
+#
+#  WHY THIS EXISTS
+#    At stage SEND_BOOKING the prompt told Claude to write a transition and
+#    append [SEND_BOOKING] because "the link is sent automatically", while the
+#    FIX-7 re-send guard stripped that tag and sent NO link. The homeowner got
+#    "Let me get you on the calendar" with nothing to click.
+#
+#  THE RULE
+#    A qualified, not-yet-booked lead whose reply transitions to scheduling
+#    gets the link in the SAME message. It is withheld only when:
+#      * Michael's most recent AUTOMATED outbound SMS already carried it
+#        (manual GHL messages never count), or
+#      * an existing safeguard applies (booked, DNC/STOP, disqualified,
+#        ai-paused, daily limit, compliance gate) - all of which run before
+#        or after this code and are untouched by it.
+#    Having received the link earlier in the thread is NOT a reason to
+#    withhold it.
+#
+#  Unqualified leads never receive the link from here; a scheduling promise
+#  to one is only logged (SCHEDULING_PROMISE_NO_LINK) for measurement.
+# ─────────────────────────────────────────────
+
+# Outgoing-reply language that promises the calendar or moves to scheduling.
+_SCHEDULING_PROMISE_RE = re.compile(
+    r"\bget\s+you\s+(?:on|onto)\s+(?:the|my|our)\s+(?:calendar|schedule)\b"
+    r"|\bget\s+you\s+(?:set\s+up|scheduled|booked|a\s+time)\b"
+    r"|\b(?:grab|pick|find|set|book|choose|lock\s+in|nail\s+down)\s+"
+    r"(?:a|the|your)\s+(?:time|slot|day|date)\b"
+    r"|\b(?:a|the)\s+time\s+(?:set|on\s+the\s+calendar)\b"
+    r"|\bon\s+the\s+calendar\b"
+    r"|\b(?:whatever|a)\s+time\s+(?:that\s+)?works\b"
+    r"|\b(?:here'?s|here\s+is)\s+(?:the|my|our)\s+(?:calendar|booking\s+link|link)\b"
+    r"|\b(?:schedule|book|set\s+up)\s+(?:a|an|your|the)\s+"
+    r"(?:time|visit|review|appointment|consult(?:ation)?|walkthrough)\b",
+    re.IGNORECASE,
+)
+
+# Used only when Claude emitted [SEND_BOOKING] and no words at all.
+_REOFFER_FALLBACK_LINE = "Here's the calendar - pick whatever time works best."
+# Used when the previous outbound already carried the link and Claude emitted
+# a bare tag: point back to it rather than sending an empty message.
+_REOFFER_POINT_BACK_LINE = ("The calendar link is in my last message - "
+                            "grab whatever time works best.")
+
+# [PB-2] Owner-approved answer to "how long does installation take?".
+# About the PHYSICAL install only - permitting, interconnection, inspection
+# and PTO are separate stages and are not folded into this number.
+INSTALL_TIME_ANSWER = (
+    "Most installations get knocked out in one day. Depending on the size of "
+    "the system, sometimes two. Let's get you a time set to show you exactly "
+    "what it would look like and answer any questions you have."
+)
+
+# A direct question about the install itself. "How long does it take?" alone
+# is NOT matched - it may mean the whole project, which Claude answers from
+# the knowledge base.
+_INSTALL_TIME_QUESTION_RE = re.compile(
+    r"\bhow\s+(?:long|many\s+days)\b[^.?!\n]{0,40}?"
+    r"\b(?:install(?:ation|ing|ed|s)?|put\s+(?:them|the\s+panels|panels)\s+(?:up|on))\b",
+    re.IGNORECASE,
+)
+# Whole-project wording: route to Claude so the stages are not conflated.
+_PROJECT_TIMELINE_RE = re.compile(
+    r"\b(?:whole|entire|overall|start\s+to\s+finish|process|permit\w*|approv\w*"
+    r"|interconnect\w*|inspect\w*|pto|turn(?:ed)?\s+on|until|before\s+i"
+    r"|start\s+(?:saving|producing|working)|up\s+and\s+running)\b",
+    re.IGNORECASE,
+)
+
+
+def contains_booking_link(text: str) -> bool:
+    """True when the text already carries a booking URL, sanitised or raw."""
+    if not text:
+        return False
+    low = text.lower()
+    return (BOOKING_LINK.lower() in low
+            or _CORRECT_BOOKING_URL.lower() in low
+            or bool(_BAD_BOOKING_URL_RE.search(text)))
+
+
+def is_scheduling_promise(text: str) -> bool:
+    """True when an outgoing reply moves to scheduling or promises the calendar."""
+    return bool(text) and bool(_SCHEDULING_PROMISE_RE.search(text))
+
+
+def is_install_time_question(text: str) -> bool:
+    """True for a direct question about how long the physical install takes."""
+    t = (text or "").strip()
+    if not t or not _INSTALL_TIME_QUESTION_RE.search(t):
+        return False
+    return not _PROJECT_TIMELINE_RE.search(t)
+
+
+def booking_link_reoffer_eligible(state: dict) -> tuple[bool, str]:
+    """
+    (eligible, reason). Qualified and not booked - and nothing else.
+
+    Belt and braces only: booked, DNC and disqualified contacts are already
+    stopped before michael_agent() reaches any caller of this.
+    """
+    stage = state.get("stage")
+    if state.get("appointment_booked") or stage == Stage.BOOKED:
+        return False, "booked"
+    if stage == Stage.DNC:
+        return False, "dnc"
+    if stage == Stage.DISQUALIFIED:
+        return False, "disqualified"
+    verdict, _ = qualification_verdict(state)
+    if verdict == VERDICT_DISQUALIFIED:
+        return False, "criterion_failed"
+    if (state.get("qualified") or verdict == VERDICT_QUALIFIED
+            or stage == Stage.SEND_BOOKING):
+        return True, "eligible"
+    return False, "not_qualified"
+
+
+def append_booking_link(contact_id: str, state: dict, reply: str, *,
+                        path: str) -> str:
+    """
+    [REOFFER-1] Return `reply` with the booking link on its own line when the
+    rule allows it; otherwise `reply` unchanged. Never adds a second link.
+
+    "Previous message" means Michael's most recent AUTOMATED outbound SMS
+    (state["last_michael_outbound"], written only by send_sms_via_ghl on an
+    accepted send). Manual GHL messages and workflow sends never count. Unknown
+    (e.g. after a restart) means nothing to suppress, so the link goes out.
+
+    Moves an eligible lead to SEND_BOOKING when the link goes out, so the
+    BOOKING_LINK_SENT tag and stage-restore stay truthful.
+    """
+    if not BOOKING_REOFFER_ENABLED:
+        return reply
+    if contains_booking_link(reply):
+        return reply
+    ok, why = booking_link_reoffer_eligible(state)
+    if not ok:
+        ev("SCHEDULING_PROMISE_NO_LINK", contact_id, path=path, reason=why)
+        return reply
+    if contains_booking_link(state.get("last_michael_outbound") or ""):
+        ev("BOOKING_LINK_REOFFER_SUPPRESSED", contact_id, path=path,
+           reason="previous_michael_outbound_had_link")
+        return reply.strip() or _REOFFER_POINT_BACK_LINE
+    base = reply.strip() or _REOFFER_FALLBACK_LINE
+    if state.get("stage") != Stage.SEND_BOOKING:
+        state["stage"] = Stage.SEND_BOOKING
+        state["booking_detected"] = True
+    ev("BOOKING_LINK_REOFFERED", contact_id, path=path)
+    return f"{base}\n{BOOKING_LINK}"
+
+
+# ─────────────────────────────────────────────
 #  OUTBOUND MESSAGE SANITISER  [FIX-6]
 #
 #  Last-line-of-defence: if Claude hallucinated
@@ -6654,6 +6845,31 @@ def michael_agent(contact_id: str, inbound_text: str, ghl_pipeline_stage: str = 
         print(f"[AGENT] Qualified : {qualified}")
         log.info(f"[{contact_id}] Intent={intent} | Qualified={qualified}")
 
+        # ── [PB-2] Direct install-time question, qualified + unbooked ──
+        # The owner-approved wording plus the link. Anyone not yet qualified
+        # falls through to Claude, which answers from the corrected knowledge
+        # base and carries on qualifying - no link, per the rule.
+        if (BOOKING_REOFFER_ENABLED
+                and intent not in ("cost_question", "process_question")
+                and is_install_time_question(inbound_text)
+                and booking_link_reoffer_eligible(state)[0]):
+            print(f"[AGENT] Path: INSTALL_TIME_QUESTION — owner-approved answer, skipping Claude")
+            log.info(f"[{contact_id}] Path=INSTALL_TIME_QUESTION (direct answer)")
+            canned = append_booking_link(
+                contact_id, state, INSTALL_TIME_ANSWER,
+                path="install_time_answer",
+            )
+            canned = sanitize_outbound_message(canned, contact_id)
+            state["messages"].append({"role": "user",      "content": inbound_text})
+            state["messages"].append({"role": "assistant", "content": canned})
+            state["last_outbound_text"] = canned
+            increment_message_count(state)
+            save_state(contact_id, state)
+            ev("INSTALL_TIME_ANSWERED", contact_id,
+               link_included=contains_booking_link(canned))
+            print(f"[AGENT] ✅ Install-time answer: {canned!r}")
+            return canned
+
         # ── Short-circuit: answer cost / process questions directly ──
         # Bypass Claude entirely for common questions — faster, more consistent,
         # and guaranteed not to ignore the question and jump to booking.
@@ -6756,13 +6972,26 @@ def michael_agent(contact_id: str, inbound_text: str, ghl_pipeline_stage: str = 
         # reach this code path because they exit via the BOOKED LOCKOUT above.
         # This guard is retained as defense-in-depth for edge cases where stage
         # is stale but appointment_booked was not yet set (race window < 1ms).
+        _reoffer_handled = False
         if new_stage == Stage.SEND_BOOKING:
             _already_sent_booking = (
                 state["stage"] in (Stage.SEND_BOOKING, Stage.BOOKED) or
                 state.get("appointment_booked")
             )
 
-            if _already_sent_booking:
+            # [REOFFER-1] Link sent earlier, not booked: the transition Claude
+            # just wrote gets the link instead of losing it. Booked contacts
+            # still take the strip-only branch below, unchanged.
+            if (_already_sent_booking and BOOKING_REOFFER_ENABLED
+                    and state["stage"] == Stage.SEND_BOOKING
+                    and not state.get("appointment_booked")):
+                new_stage = None   # stage is already SEND_BOOKING
+                _reoffer_handled = True
+                clean_reply = append_booking_link(
+                    contact_id, state, clean_reply,
+                    path="send_booking_tag",
+                )
+            elif _already_sent_booking:
                 print(
                     f"[AGENT] 🔒 [SEND_BOOKING] suppressed (belt+suspenders guard) — "
                     f"stage={state['stage']} / appointment_booked={state.get('appointment_booked')}"
@@ -6827,6 +7056,20 @@ def michael_agent(contact_id: str, inbound_text: str, ghl_pipeline_stage: str = 
         # Without this the legacy fields and the record disagree until the
         # homeowner replies again, and the prompt is built from the stale half.
         sync_qualification_fields(state)
+
+        # ── [REOFFER-1] Deterministic backstop ────────────────────
+        # Claude wrote scheduling language without [SEND_BOOKING]. A promise
+        # of the calendar must never go out without the calendar. Runs after
+        # the stage update, so a [DISQUALIFY]/[DNC] tag in this same reply has
+        # already made the lead ineligible.
+        if (BOOKING_REOFFER_ENABLED and not _reoffer_handled
+                and is_scheduling_promise(clean_reply)
+                and not contains_booking_link(clean_reply)):
+            clean_reply = append_booking_link(
+                contact_id, state, clean_reply,
+                path="scheduling_promise_backstop",
+            )
+            sync_qualification_fields(state)
 
         # ── [FIX-6] Sanitise before sending — catch any hallucinated URL ──
         clean_reply = sanitize_outbound_message(clean_reply, contact_id)
@@ -7726,6 +7969,13 @@ async def send_sms_via_ghl(contact_id: str, message: str, to_number: str = "",
                  f"message_id={_msg_id!r} to={_resolved_to_number!r}")
         ev("SMS_ACCEPTED", contact_id, kind=kind.value, message_id=_msg_id or "(none)",
            http=r.status_code, note="queued_not_delivered")
+        # [REOFFER-1] Michael's most recent AUTOMATED outbound SMS - the only
+        # "previous message" the booking-link suppression rule reads. Manual
+        # GHL sends never pass through this function, so they never count.
+        try:
+            get_state(contact_id)["last_michael_outbound"] = payload["message"]
+        except Exception:
+            pass
         return {
             "status"       : SendStatus.ACCEPTED.value,
             "accepted"     : True,
@@ -11414,7 +11664,9 @@ SOLAR FACTS — USE THESE, DON'T INVENT NUMBERS
   to match the home's actual usage so excess generation isn't compensated at lower wholesale rates.
 - Break-even on owned system: 8–12 years. Panels warrantied 25 years.
 - Qualification threshold: $100+/month Ameren bill. Under $100, rarely pencils out.
-- Process: 1 install day. Permits + Ameren interconnection: 3–4 weeks total.
+- Install: most installations take one day; a bigger system sometimes takes two. Never call the
+  install itself 1–3 days. Permits + Ameren interconnection: 3–4 weeks total — separate from the
+  install day, along with inspection and permission to operate (PTO).
 - Service area: Missouri side of the St. Louis metro only — St. Louis County, St. Charles, Jefferson,
   Franklin, Lincoln, Warren counties, and surrounding Missouri-side areas. We do NOT serve Illinois,
   rural co-ops, or non-Ameren utilities.
