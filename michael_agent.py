@@ -631,6 +631,35 @@ async def _log_every_request(request: Request, call_next):
     return response
 
 
+# ── [SEC-1] Debug-surface gate ───────────────────────────────────────────────
+# Registered AFTER _log_every_request, so Starlette makes it the OUTERMOST
+# middleware: it decides before routing, CORS or any handler runs.
+#   DEBUG_ROUTES_ENABLED off -> 404 (indistinguishable from a missing route)
+#   on                       -> the shared secret check (503 / 401) applies
+# The match is case-insensitive on the decoded path, so /DEBUG/..., /debug/,
+# and percent-encoded variants are all caught. Only the route NAME is logged;
+# ids, bodies and headers never are.
+def _is_debug_path(path: str) -> bool:
+    p = (path or "").lower()
+    return p == "/debug" or p.startswith("/debug/")
+
+
+@app.middleware("http")
+async def _debug_surface_gate(request: Request, call_next):
+    if not _is_debug_path(request.url.path):
+        return await call_next(request)
+    _route = "/".join(request.url.path.lower().split("/")[:3])
+    if not DEBUG_ROUTES_ENABLED:
+        print(f"[SEC] debug route blocked (disabled) | {request.method} {_route}", flush=True)
+        return JSONResponse({"detail": "Not Found"}, status_code=404)
+    _auth = _debug_auth_error(request)
+    if _auth is not None:
+        print(f"[SEC] debug route blocked (auth) | {request.method} {_route} "
+              f"-> {_auth.status_code}", flush=True)
+        return _auth
+    return await call_next(request)
+
+
 # ── [FIX-7.C] Startup diagnostic — prints immediately when uvicorn is ready ──
 # Confirms: (a) this Python file was loaded, (b) FastAPI registered the routes,
 # (c) stdout is working.  Look for this block after "Uvicorn running on http://..."
@@ -806,6 +835,13 @@ BOOKED_TAG      = os.getenv("BOOKED_TAG", "appointment booked")
 # No default and no fallback: when unset the endpoint is hard-disabled (503),
 # so an un-configured deployment cannot expose it.  Never logged.
 DEBUG_RESET_SECRET = os.getenv("DEBUG_RESET_SECRET", "")
+
+# [SEC-1] Master switch for the ENTIRE /debug/* surface. Default OFF: every
+# /debug path answers 404 exactly like a route that does not exist, before any
+# handler runs. Turning it on still requires DEBUG_RESET_SECRET on every call.
+DEBUG_ROUTES_ENABLED = str(
+    os.getenv("DEBUG_ROUTES_ENABLED", "false")
+).strip().lower() in ("1", "true", "yes", "on")
 
 
 # ─────────────────────────────────────────────
@@ -10896,24 +10932,19 @@ def _debug_auth_error(request: Request) -> Optional[JSONResponse]:
             {"error": "debug endpoint disabled: DEBUG_RESET_SECRET is not configured"},
             status_code=503,
         )
+    # [SEC-1] A secret that reuses a production credential is a
+    # misconfiguration - refuse rather than accept it.
+    if DEBUG_RESET_SECRET in {GHL_API_KEY, os.getenv("ANTHROPIC_API_KEY", "")}:
+        log.warning("[DEBUG-AUTH] 503 - DEBUG_RESET_SECRET reuses a production credential")
+        return JSONResponse(
+            {"error": "debug endpoint disabled: DEBUG_RESET_SECRET is misconfigured"},
+            status_code=503,
+        )
     _supplied = request.headers.get("X-Debug-Secret", "")
     if not (_supplied and hmac.compare_digest(_supplied, DEBUG_RESET_SECRET)):
         log.warning("[DEBUG-AUTH] 401 - missing or invalid X-Debug-Secret")
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     return None
-
-@app.get("/debug/state/{contact_id}")
-async def debug_get_state(contact_id: str):
-    """
-    Inspect in-memory state for a contact.
-    GET /debug/state/{contact_id}
-    """
-    if contact_id not in _state_store:
-        return JSONResponse({"found": False, "contact_id": contact_id, "note": "No state — contact is INITIAL"})
-    s = _state_store[contact_id].copy()
-    s["stage"] = str(s.get("stage", "UNKNOWN"))
-    return JSONResponse({"found": True, "contact_id": contact_id, "state": s})
-
 
 @app.post("/debug/reset/{contact_id}")
 async def debug_reset_state(contact_id: str, request: Request):
@@ -11171,58 +11202,6 @@ async def debug_reset_contact(request: Request):
             "appointments were not modified."
         ),
     })
-
-
-@app.post("/debug/send-test-sms")
-async def debug_send_test_sms(request: Request):
-    """
-    Fire a test SMS directly through GHL (bypasses agent).
-    POST body: {"contact_id": "...", "to_number": "+1...", "message": "..."}
-    """
-    try:
-        body       = await request.json()
-        contact_id = body.get("contact_id", "")
-        to_number  = body.get("to_number",  "")
-        message    = body.get("message",    "Test from Michael agent — SMS config OK ✅")
-
-        if not contact_id:
-            return JSONResponse({"error": "contact_id is required"}, status_code=400)
-
-        print(f"\n[DEBUG-SMS] Manual test SMS | contact={contact_id!r} | to={to_number!r}")
-        await send_sms_via_ghl(contact_id, message, to_number=to_number,
-                               kind=SendKind.SYSTEM)
-        return JSONResponse({"status": "sent", "contact_id": contact_id, "to_number": to_number, "message": message})
-
-    except Exception as err:
-        print(f"[ERROR] Debug SMS failed:\n{traceback.format_exc()}")
-        return JSONResponse({"status": "error", "detail": str(err)})
-
-
-@app.post("/debug/set-state/{contact_id}")
-async def debug_set_stage(contact_id: str, request: Request):
-    """
-    Manually set state fields for a contact — useful for testing a specific stage.
-    POST body: {"stage": "ASK_BILL", "homeowner": "yes", "monthly_bill": "$200/month"}
-    """
-    try:
-        updates = await request.json()
-        state   = get_state(contact_id)
-        if "stage" in updates:
-            try:
-                state["stage"] = Stage(updates["stage"])
-            except ValueError:
-                return JSONResponse({"error": f"Unknown stage: {updates['stage']}"}, status_code=400)
-        for field in ("homeowner", "location_confirmed", "monthly_bill", "phone", "address",
-                      "bill_reminder_sent", "bill_ack_sent", "contact_name",
-                      "entry_path", "lead_source"):
-            if field in updates:
-                state[field] = updates[field]
-        save_state(contact_id, state)
-        s = state.copy()
-        s["stage"] = str(s["stage"])
-        return JSONResponse({"updated": True, "contact_id": contact_id, "state": s})
-    except Exception as err:
-        return JSONResponse({"error": str(err)}, status_code=400)
 
 
 # ─────────────────────────────────────────────
@@ -11574,7 +11553,9 @@ async def health():
             "last_hold_at"                 : _qh_stats["last_hold_at"],
             "last_resume_at"               : _qh_stats["last_resume_at"],
             "last_hold_failure_at"         : _qh_stats["last_hold_failure_at"],
-            "last_hold_failure_contact"    : _qh_stats["last_hold_failure_contact"],
+            # [SEC-1] Public endpoint: last 4 characters only, never a full contact id.
+            "last_hold_failure_contact"    : (("***" + _qh_stats["last_hold_failure_contact"][-4:])
+                                              if _qh_stats["last_hold_failure_contact"] else ""),
             "authoritative_queue"          : f"GHL tag '{TAG_AFTER_HOURS_HOLD}'",
         },
     }
@@ -11772,25 +11753,6 @@ HARD RULES — THESE OVERRIDE EVERYTHING ABOVE
   Primary framing: owning the system, locking in a predictable cost, protection from Ameren rate cases.
 """
 
-@app.get("/debug/claude-test")
-def debug_claude_test():
-    import os
-    from anthropic import Anthropic
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    print("API KEY FOUND:", bool(api_key), flush=True)
-    print("API KEY PREFIX:", api_key[:12] if api_key else "NONE", flush=True)
-    client = Anthropic(api_key=api_key)
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=50,
-        messages=[{"role": "user", "content": "Say hello in one sentence."}]
-    )
-    return {
-        "success": True,
-        "reply": response.content[0].text
-    }
-
-
 @app.post("/webhook/website-chat")
 async def website_chat(payload: dict):
     """
@@ -11822,8 +11784,7 @@ async def website_chat(payload: dict):
 
     # ── 3. API KEY CHECK ──────────────────────────────────────────────────────
     api_key = os.getenv("ANTHROPIC_API_KEY")
-    print(f"[website-chat] api_key present={bool(api_key)} "
-          f"prefix={api_key[:12] if api_key else 'NONE'}", flush=True)
+    print(f"[website-chat] api_key present={bool(api_key)}", flush=True)  # [SEC-1] never a prefix
 
     if not api_key:
         error_msg = "ANTHROPIC_API_KEY is not set in environment variables"
